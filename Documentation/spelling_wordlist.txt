@@ -728,6 +728,7 @@ prepulls
 prerequirement
 priori
 priorityClassName
+procfs
 productpage
 profiler
 prog

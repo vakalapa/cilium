@@ -825,6 +825,7 @@ data:
   enable-bgp-control-plane: "false"
 {{- end }}
 
+  procfs: {{ .Values.procfs | quote }}
 {{- if hasKey .Values.bpf "root" }}
   bpf-root: {{ .Values.bpf.root | quote }}
 {{- end }}

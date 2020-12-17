@@ -1389,6 +1389,10 @@
      - The priority class to use for cilium-agent.
      - string
      - ``""``
+   * - procfs
+     - 
+     - string
+     - ``"/host/proc"``
    * - prometheus
      - Configure prometheus metrics on the configured port at /metrics
      - object
@@ -1448,7 +1452,7 @@
    * - securityContext
      - Security context to be added to agent pods
      - object
-     - ``{}``
+     - ``{"privileged":false}``
    * - serviceAccounts
      - Define serviceAccount names for components.
      - object
