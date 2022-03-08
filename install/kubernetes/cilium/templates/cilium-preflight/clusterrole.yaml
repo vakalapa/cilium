@@ -40,11 +40,17 @@ rules:
   resources:
   - nodes
   verbs:
-  - update
 - apiGroups:
   - ""
   resources:
   - nodes
+  verbs:
+  # To remove node taints and to annotate node
+  - update
+- apiGroups:
+  - ""
+  resources:
+  # To set NodeNetworkUnavailable: false on startup
   - nodes/status
   verbs:
   - patch
