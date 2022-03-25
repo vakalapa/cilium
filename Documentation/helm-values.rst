@@ -1261,6 +1261,10 @@
      - Labels to add to ServiceMonitor cilium-operator
      - object
      - ``{}``
+   * - operator.removeNodeTaints
+     - Remove Cilium node taint from Kubernetes nodes that have a healthy Cilium pod running
+     - bool
+     - ``true``
    * - operator.replicas
      - Number of replicas to run for the cilium-operator deployment
      - int
@@ -1277,6 +1281,10 @@
      - Security context to be added to cilium-operator pods
      - object
      - ``{}``
+   * - operator.setNodeNetworkStatus
+     - Set Node condition NetworkUnavailable to 'false' with the reason 'CiliumIsUp' for nodes that have a healthy Cilium pod.
+     - bool
+     - ``true``
    * - operator.skipCRDCreation
      - Skip CRDs creation for cilium-operator
      - bool

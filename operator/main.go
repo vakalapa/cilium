@@ -488,6 +488,20 @@ func onOperatorStartLeading(ctx context.Context) {
 		startKvstoreWatchdog()
 	}
 
+	if k8s.IsEnabled() &&
+		(operatorOption.Config.RemoveCiliumNodeTaints || operatorOption.Config.SetCiliumIsUpCondition) {
+		stopCh := make(chan struct{})
+
+		log.WithFields(logrus.Fields{
+			logfields.K8sNamespace:       operatorOption.Config.CiliumK8sNamespace,
+			"label-selector":             operatorOption.Config.CiliumPodLabels,
+			"remove-cilium-node-taints":  operatorOption.Config.RemoveCiliumNodeTaints,
+			"set-cilium-is-up-condition": operatorOption.Config.SetCiliumIsUpCondition,
+		}).Info("Removing Cilium Node Taints or Setting Cilium Is Up Condition for Kubernetes Nodes")
+
+		operatorWatchers.HandleNodeTolerationAndTaints(stopCh)
+	}
+
 	if err := startSynchronizingCiliumNodes(ctx, nodeManager, withKVStore); err != nil {
 		log.WithError(err).Fatal("Unable to setup node watcher")
 	}

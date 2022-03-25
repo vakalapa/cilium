@@ -764,6 +764,7 @@ regex
 regexes
 relocations
 remoteNodeIdentity
+removeNodeTaints
 reparsing
 replicaset
 repo
@@ -813,6 +814,7 @@ serviceAnnotations
 serviceMonitor
 servicePort
 sessionAffinity
+setNodeNetworkStatus
 setrlimit
 setupinterface
 setupiptables
