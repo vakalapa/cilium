@@ -175,10 +175,9 @@ jobs:
 
       - name: Install Cilium CLI
         run: |
-          curl -sSL --remote-name-all https://github.com/cilium/cilium-cli/releases/download/${{ env.cilium_cli_version }}/cilium-linux-amd64.tar.gz{,.sha256sum}
-          sha256sum --check cilium-linux-amd64.tar.gz.sha256sum
-          sudo tar xzvfC cilium-linux-amd64.tar.gz /usr/local/bin
-          rm cilium-linux-amd64.tar.gz{,.sha256sum}
+          docker create -ti --name cilium-cli quay.io/cilium/cilium-cli-ci:151601c8fe5c1395e1701ba3f79a5c85841fd0fd@sha256:76cf6662e69bf81155033102ecf8b2eaf6b40b5ad3a8375851d3692465446b42 bash
+          docker cp cilium-cli:/usr/local/bin/cilium /usr/local/bin/cilium
+          docker rm -fv cilium-cli
           cilium version
 
       - name: Set up gcloud CLI
@@ -239,6 +238,10 @@ jobs:
       - name: Install Cilium in cluster
         run: |
           cilium install ${{ steps.vars.outputs.cilium_install_defaults }}
+
+      - name: Wait for cilium status to be ready before enabling cluster mesh
+        run: |
+          cilium status --wait
 
       - name: Enable cluster mesh
         run: |
