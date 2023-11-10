@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"net"
 	"sync"
-	"time"
 
 	"github.com/sirupsen/logrus"
 
@@ -23,6 +22,7 @@ import (
 	"github.com/cilium/cilium/pkg/node"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/source"
+	"github.com/cilium/cilium/pkg/time"
 )
 
 var (
@@ -143,7 +143,7 @@ func (l *BPFListener) OnIPIdentityCacheChange(modType ipcache.CacheModification,
 
 	// Update BPF Maps.
 
-	key := ipcacheMap.NewKey(cidr.IP, cidr.Mask, uint8(cidrCluster.ClusterID()))
+	key := ipcacheMap.NewKey(cidr.IP, cidr.Mask, uint16(cidrCluster.ClusterID()))
 
 	switch modType {
 	case ipcache.Upsert:

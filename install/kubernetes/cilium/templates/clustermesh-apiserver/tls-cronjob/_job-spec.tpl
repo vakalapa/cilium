@@ -49,6 +49,10 @@ spec:
           {{- toYaml . | nindent 10 }}
           {{- end }}
       hostNetwork: true
+      {{- with .Values.certgen.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       serviceAccount: {{ .Values.serviceAccounts.clustermeshcertgen.name | quote }}
       serviceAccountName: {{ .Values.serviceAccounts.clustermeshcertgen.name | quote }}
       automountServiceAccountToken: {{ .Values.serviceAccounts.clustermeshcertgen.automount }}
@@ -60,6 +64,10 @@ spec:
       {{- with .Values.certgen.extraVolumes }}
       volumes:
       {{- toYaml . | nindent 6 }}
+      {{- end }}
+      affinity:
+      {{- with .Values.certgen.affinity }}
+      {{- toYaml . | nindent 8 }}
       {{- end }}
   ttlSecondsAfterFinished: {{ .Values.certgen.ttlSecondsAfterFinished }}
 {{- end }}

@@ -17,7 +17,7 @@ MIN_K8S_VERSION := "v$(MIN_K8S_MAJOR).$(MIN_K8S_MINOR).0"
 CILIUM_CHARTS := $(ROOT_DIR)/$(RELATIVE_DIR)/cilium
 CHART_FILE := "$(CILIUM_CHARTS)/Chart.yaml"
 
-VALUES_TMPL_FILE_NAME ?= *values.yaml.tmpl*
+VALUES_TMPL_FILE_NAME ?= *values.yaml.tmpl
 
 VERSION_REGEX := '[0-9]\+\.[0-9]\+\.[0-9]\+.*'
 CILIUM_CHART_REGEX := '\([vV]ersion:\) '$(VERSION_REGEX)
@@ -75,4 +75,4 @@ docs:
 check-docker-images: # Check whether docker images are available for the current version.
 	$(QUIET)$(ROOT_DIR)/contrib/release/check-docker-images.sh "$(CILIUM_VERSION)"
 
-.PHONY: all check-docker-images check-values-yaml clean docs lint update-chart update-versions
+.PHONY: all check-docker-images check-values-yaml cilium/values.yaml clean docs lint update-chart update-versions

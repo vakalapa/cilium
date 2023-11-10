@@ -4,11 +4,13 @@
 package translation
 
 import (
+	"slices"
 	"sort"
 	"testing"
 
 	envoy_config_core_v3 "github.com/cilium/proxy/go/envoy/config/core/v3"
 	envoy_config_listener "github.com/cilium/proxy/go/envoy/config/listener/v3"
+	httpConnectionManagerv3 "github.com/cilium/proxy/go/envoy/extensions/filters/network/http_connection_manager/v3"
 	envoy_extensions_transport_sockets_tls_v3 "github.com/cilium/proxy/go/envoy/extensions/transport_sockets/tls/v3"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
@@ -27,6 +29,42 @@ func TestNewHTTPListener(t *testing.T) {
 
 		require.Equal(t, "dummy-name", listener.Name)
 		require.Len(t, listener.GetListenerFilters(), 1)
+		require.Len(t, listener.GetFilterChains(), 1)
+	})
+
+	t.Run("with default XffNumTrustedHops", func(t *testing.T) {
+		res, err := NewHTTPListener("dummy-name", "dummy-secret-namespace", nil)
+		require.Nil(t, err)
+
+		listener := &envoy_config_listener.Listener{}
+		err = proto.Unmarshal(res.Value, listener)
+		require.Nil(t, err)
+		require.Len(t, listener.GetFilterChains(), 1)
+		require.Len(t, listener.GetFilterChains()[0].Filters, 1)
+		httpConnectionManager := &httpConnectionManagerv3.HttpConnectionManager{}
+		err = proto.Unmarshal(listener.GetFilterChains()[0].Filters[0].ConfigType.(*envoy_config_listener.Filter_TypedConfig).TypedConfig.Value, httpConnectionManager)
+		require.Nil(t, err)
+		// Default value is 0
+		require.Equal(t, uint32(0), httpConnectionManager.XffNumTrustedHops)
+
+	})
+
+	t.Run("without TLS with Proxy Protocol", func(t *testing.T) {
+		res, err := NewHTTPListener("dummy-name", "dummy-secret-namespace", nil, WithProxyProtocol())
+		require.Nil(t, err)
+
+		listener := &envoy_config_listener.Listener{}
+		err = proto.Unmarshal(res.Value, listener)
+		require.Nil(t, err)
+
+		require.Equal(t, "dummy-name", listener.Name)
+
+		listenerNames := []string{}
+		for _, l := range listener.GetListenerFilters() {
+			listenerNames = append(listenerNames, l.Name)
+		}
+		slices.Sort(listenerNames)
+		require.Equal(t, []string{proxyProtocolType, tlsInspectorType}, listenerNames)
 		require.Len(t, listener.GetFilterChains(), 1)
 	})
 
@@ -92,6 +130,25 @@ func TestNewSNIListener(t *testing.T) {
 
 		require.Equal(t, "dummy-name", listener.Name)
 		require.Len(t, listener.GetListenerFilters(), 1)
+		require.Len(t, listener.GetFilterChains(), 1)
+		require.Len(t, listener.GetFilterChains()[0].FilterChainMatch.ServerNames, 2)
+	})
+
+	t.Run("normal SNI listener with Proxy Protocol", func(t *testing.T) {
+		res, err := NewSNIListener("dummy-name", map[string][]string{"dummy-namespace/dummy-service:443": {"example.org", "example.com"}}, WithProxyProtocol())
+		require.Nil(t, err)
+
+		listener := &envoy_config_listener.Listener{}
+		err = proto.Unmarshal(res.Value, listener)
+		require.Nil(t, err)
+
+		require.Equal(t, "dummy-name", listener.Name)
+		listenerNames := []string{}
+		for _, l := range listener.GetListenerFilters() {
+			listenerNames = append(listenerNames, l.Name)
+		}
+		slices.Sort(listenerNames)
+		require.Equal(t, []string{proxyProtocolType, tlsInspectorType}, listenerNames)
 		require.Len(t, listener.GetFilterChains(), 1)
 		require.Len(t, listener.GetFilterChains()[0].FilterChainMatch.ServerNames, 2)
 	})

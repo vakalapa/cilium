@@ -17,30 +17,31 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 
 	"github.com/cilium/cilium/operator/pkg/gateway-api/helpers"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 )
 
-const (
-	backendServiceIndex = "backendServiceIndex"
-	gatewayIndex        = "gatewayIndex"
-)
-
 // httpRouteReconciler reconciles a HTTPRoute object
 type httpRouteReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+}
 
-	Model *internalModel
+func newHTTPRouteReconciler(mgr ctrl.Manager) *httpRouteReconciler {
+	return &httpRouteReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}
 }
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *httpRouteReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &gatewayv1beta1.HTTPRoute{}, backendServiceIndex,
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &gatewayv1.HTTPRoute{}, backendServiceIndex,
 		func(rawObj client.Object) []string {
-			hr, ok := rawObj.(*gatewayv1beta1.HTTPRoute)
+			hr, ok := rawObj.(*gatewayv1.HTTPRoute)
 			if !ok {
 				return nil
 			}
@@ -64,9 +65,9 @@ func (r *httpRouteReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		return err
 	}
 
-	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &gatewayv1beta1.HTTPRoute{}, gatewayIndex,
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &gatewayv1.HTTPRoute{}, gatewayIndex,
 		func(rawObj client.Object) []string {
-			hr := rawObj.(*gatewayv1beta1.HTTPRoute)
+			hr := rawObj.(*gatewayv1.HTTPRoute)
 			var gateways []string
 			for _, parent := range hr.Spec.ParentRefs {
 				if !helpers.IsGateway(parent) {
@@ -87,13 +88,13 @@ func (r *httpRouteReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 	return ctrl.NewControllerManagedBy(mgr).
 		// Watch for changes to HTTPRoute
-		For(&gatewayv1beta1.HTTPRoute{}).
+		For(&gatewayv1.HTTPRoute{}).
 		// Watch for changes to Backend services
 		Watches(&corev1.Service{}, r.enqueueRequestForBackendService()).
 		// Watch for changes to Reference Grants
-		Watches(&gatewayv1beta1.ReferenceGrant{}, r.enqueueRequestForRequestGrant()).
-		// Watch for changes to Gateways and enqueue HTTPRoutes that reference them,
-		Watches(&gatewayv1beta1.Gateway{}, r.enqueueRequestForGateway(),
+		Watches(&gatewayv1beta1.ReferenceGrant{}, r.enqueueRequestForReferenceGrant()).
+		// Watch for changes to Gateways and enqueue HTTPRoutes that reference them
+		Watches(&gatewayv1.Gateway{}, r.enqueueRequestForGateway(),
 			builder.WithPredicates(
 				predicate.NewPredicateFuncs(hasMatchingController(context.Background(), mgr.GetClient(), controllerName)))).
 		Complete(r)
@@ -105,8 +106,9 @@ func (r *httpRouteReconciler) enqueueRequestForBackendService() handler.EventHan
 	return handler.EnqueueRequestsFromMapFunc(r.enqueueFromIndex(backendServiceIndex))
 }
 
-// enqueueRequestForRequestGrant makes sure that HTTP Routes in the same namespace are reconciled
-func (r *httpRouteReconciler) enqueueRequestForRequestGrant() handler.EventHandler {
+// enqueueRequestForReferenceGrant makes sure that all HTTP Routes are reconciled
+// if a ReferenceGrant changes
+func (r *httpRouteReconciler) enqueueRequestForReferenceGrant() handler.EventHandler {
 	return handler.EnqueueRequestsFromMapFunc(r.enqueueAll())
 }
 
@@ -120,7 +122,7 @@ func (r *httpRouteReconciler) enqueueFromIndex(index string) handler.MapFunc {
 			logfields.Controller: "httpRoute",
 			logfields.Resource:   client.ObjectKeyFromObject(o),
 		})
-		hrList := &gatewayv1beta1.HTTPRouteList{}
+		hrList := &gatewayv1.HTTPRouteList{}
 
 		if err := r.Client.List(ctx, hrList, &client.ListOptions{
 			FieldSelector: fields.OneTermEqualSelector(index, client.ObjectKeyFromObject(o).String()),
@@ -150,7 +152,7 @@ func (r *httpRouteReconciler) enqueueAll() handler.MapFunc {
 			logfields.Controller: "httpRoute",
 			logfields.Resource:   client.ObjectKeyFromObject(o),
 		})
-		hrList := &gatewayv1beta1.HTTPRouteList{}
+		hrList := &gatewayv1.HTTPRouteList{}
 
 		if err := r.Client.List(ctx, hrList, &client.ListOptions{}); err != nil {
 			scopedLog.WithError(err).Error("Failed to get HTTPRoutes")

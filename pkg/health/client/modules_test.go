@@ -5,8 +5,11 @@ package client_test
 
 import (
 	"bytes"
+	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 
@@ -33,9 +36,14 @@ func TestGetAndFormatModulesHealth(t *testing.T) {
 		"happy-verbose": {
 			h: newTestMHappy(),
 			e: `Modules Health:
-  Module	Status	Message	Last Updated
-  m1	OK	a ok	          2s
-  m2	Degraded	doh	         20s`,
+agent
+├── m1                                                      [OK] status nominal (2s, x0)
+└── a
+    └── b
+        └── c
+            ├── fred                                        [OK] yo (20s, x1)
+            │   └── blee                                    [OK] doh (20s, x1)
+            └── dork                                        [DEGRADED] bozo -- BOOM! (20s, x1)`,
 			v: true,
 		},
 	}
@@ -69,24 +77,79 @@ func newTestMHappy() *testMHappy {
 }
 
 func (m *testMHappy) GetHealth(params *daemon.GetHealthParams, opts ...daemon.ClientOption) (*daemon.GetHealthOK, error) {
+	t1, t2 := time.Now().Add(-1*time.Second*2), time.Now().Add(-1*time.Second*20)
 	return &daemon.GetHealthOK{
 		Payload: &models.ModulesHealth{
 			Modules: []*models.ModuleHealth{
 				{
 					ModuleID:    "m1",
 					Level:       string(cell.StatusOK),
-					Message:     "a ok",
+					Message:     makeSimpleMsg(t1),
 					LastOk:      "3s",
 					LastUpdated: "2s",
 				},
 				{
-					ModuleID:    "m2",
+					ModuleID:    "a.b.c",
 					Level:       string(cell.StatusDegraded),
-					Message:     "doh",
+					Message:     makeComplexMsg(t2),
 					LastOk:      "5m30s",
 					LastUpdated: "20s",
 				},
 			},
 		},
 	}, nil
+}
+
+func makeSimpleMsg(t time.Time) string {
+	s := cell.StatusNode{
+		Name:            "m1",
+		LastLevel:       cell.StatusOK,
+		UpdateTimestamp: t,
+		Message:         "status nominal",
+	}
+
+	bb, _ := json.Marshal(s)
+	return string(bb)
+}
+
+func makeComplexMsg(t time.Time) string {
+	s := cell.StatusNode{
+		Name:      "a.b.c",
+		LastLevel: cell.StatusOK,
+		Count:     1,
+		SubStatuses: []*cell.StatusNode{
+			{
+				Name:      "fred",
+				LastLevel: cell.StatusOK,
+				Count:     1,
+				SubStatuses: []*cell.StatusNode{
+					{
+						Name:            "blee",
+						LastLevel:       cell.StatusOK,
+						Message:         "doh",
+						UpdateTimestamp: t,
+						Count:           1,
+					},
+					{
+						Name:            "fred",
+						LastLevel:       cell.StatusOK,
+						Message:         "yo",
+						UpdateTimestamp: t,
+						Count:           1,
+					},
+				},
+			},
+			{
+				Name:            "dork",
+				LastLevel:       cell.StatusDegraded,
+				Message:         "bozo",
+				Count:           1,
+				Error:           fmt.Errorf("BOOM!").Error(),
+				UpdateTimestamp: t,
+			},
+		},
+	}
+
+	bb, _ := json.Marshal(s)
+	return string(bb)
 }

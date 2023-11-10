@@ -17,6 +17,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/cilium/cilium/pkg/cidr"
 	"github.com/cilium/cilium/pkg/hive"
 	"github.com/cilium/cilium/pkg/hive/cell"
 )
@@ -197,6 +198,40 @@ func TestHiveConfigOverride(t *testing.T) {
 	assert.Equal(t, "override", cfg.Foo, "Config.Foo not set correctly")
 }
 
+type CIDRSliceConfig struct {
+	Foo []*cidr.CIDR
+}
+
+func (CIDRSliceConfig) Flags(flags *pflag.FlagSet) {
+	flags.StringSlice("foo", nil, "foo")
+}
+
+func TestHiveCIDRSlice(t *testing.T) {
+	var cfg CIDRSliceConfig
+	testCell := cell.Module(
+		"test",
+		"Test Module",
+		cell.Config(CIDRSliceConfig{}),
+		cell.Invoke(func(c CIDRSliceConfig) {
+			cfg = c
+		}),
+	)
+	hive := hive.New(testCell)
+
+	flags := pflag.NewFlagSet("", pflag.ContinueOnError)
+	hive.RegisterFlags(flags)
+	flags.Set("foo", "1.2.3.4/24,2001:db8::/64")
+
+	err := hive.Start(context.TODO())
+	require.NoError(t, err, "expected Start to succeed")
+	err = hive.Stop(context.TODO())
+	require.NoError(t, err, "expected Stop to succeed")
+
+	require.Len(t, cfg.Foo, 2)
+	require.Equal(t, cidr.MustParseCIDR("1.2.3.4/24"), cfg.Foo[0], "Config.Foo not set correctly")
+	require.Equal(t, cidr.MustParseCIDR("2001:db8::/64"), cfg.Foo[1], "Config.Foo not set correctly")
+}
+
 type SomeObject struct {
 	X int
 }
@@ -224,6 +259,39 @@ func TestProvideInvoke(t *testing.T) {
 	assert.True(t, invoked, "expected invoke to be called, but it was not")
 }
 
+func TestModuleID(t *testing.T) {
+	invoked := false
+	inner := cell.Module(
+		"inner",
+		"inner module",
+		cell.Invoke(func(id cell.ModuleID, fid cell.FullModuleID) error {
+			invoked = true
+			if id != "inner" {
+				return fmt.Errorf("inner id mismatch, expected 'inner', got %q", id)
+			}
+			if fid.String() != "outer.inner" {
+				return fmt.Errorf("outer id mismatch, expected 'outer.inner', got %q", fid)
+			}
+			return nil
+		}),
+	)
+
+	outer := cell.Module(
+		"outer",
+		"outer module",
+		inner,
+	)
+
+	err := hive.New(
+		outer,
+		shutdownOnStartCell,
+	).Run()
+	assert.NoError(t, err, "expected Run to succeed")
+
+	assert.True(t, invoked, "expected invoke to be called, but it was not")
+
+}
+
 func TestProvideHealthReporter(t *testing.T) {
 	// Module provided health reporter should be injected and be scoped to the
 	// module ID.
@@ -232,52 +300,55 @@ func TestProvideHealthReporter(t *testing.T) {
 	testCell := cell.Module(
 		"test",
 		"Test Module",
-		cell.Invoke(func(hr cell.HealthReporter) {
+		cell.Invoke(func(s cell.Scope) {
+			hr := cell.GetHealthReporter(s, "test")
 			hr.OK("all good")
-			hr.Stopped("done!")
+			hr.Stopped("stopped")
 		}),
 	)
 	testCell2 := cell.Module(
 		"test2",
 		"Test Module 2",
-		cell.Invoke(func(hr cell.HealthReporter) {
-			hr.Degraded("woops", fmt.Errorf("someerr"))
+		cell.Invoke(func(s cell.Scope) {
+			hr := cell.GetHealthReporter(s, "test")
+			hr.Degraded("degraded", nil)
 		}),
 	)
 	unknown := cell.Module(
 		"unknown",
 		"Reports no status",
-		cell.Invoke(func(cell.HealthReporter) {}),
+		cell.Invoke(func(s cell.Scope) {}),
 	)
 
-	var s1, s2, s3 *cell.Status
-	var all []cell.Status
+	var chp cell.Health
 	h := hive.New(
 		testCell,
 		testCell2,
 		unknown,
-		cell.Invoke(func(lc hive.Lifecycle, shutdowner hive.Shutdowner, hr cell.Health) {
+		cell.Invoke(func(lc hive.Lifecycle, _ hive.Shutdowner, hp cell.Health) {
 			lc.Append(hive.Hook{
 				OnStop: func(hive.HookContext) error {
-					all = hr.All()
-					s1 = hr.Get("test")
-					s2 = hr.Get("test2")
-					s3 = hr.Get("unknown")
+					chp = hp
 					return nil
 				}})
 		}),
 		shutdownOnStartCell,
 	)
+
 	assert.NoError(t, h.Run(), "expected Run to succeed")
-	assert.Len(t, all, 3, "expected two health reports")
-	assert.Equal(t, s1.Level, cell.StatusOK)
-	assert.Equal(t, s1.ModuleID, "test")
-	assert.Equal(t, s1.Err, nil)
-	assert.True(t, s1.Stopped)
-	assert.Equal(t, s2.Level, cell.StatusDegraded)
-	assert.Equal(t, s2.ModuleID, "test2")
-	assert.Equal(t, s2.Err, fmt.Errorf("someerr"))
-	assert.Equal(t, s3.Level, cell.StatusUnknown)
+	s1, err := chp.Get(cell.FullModuleID{"test"})
+	assert.NoError(t, err)
+	s2, err := chp.Get(cell.FullModuleID{"test2"})
+	assert.NoError(t, err)
+	s3, err := chp.Get(cell.FullModuleID{"unknown"})
+	assert.NoError(t, err)
+	assert.Len(t, chp.All(), 3, "expected two health reports")
+	assert.Equal(t, cell.StatusOK, s1.Level())
+
+	//assert.Equal(t, s1.FullModuleID, cell.FullModuleID{"test"})
+	assert.Equal(t, cell.StatusDegraded, s2.Level())
+	//assert.Equal(t, s2.FullModuleID, cell.FullModuleID{"test2"})
+	assert.Equal(t, cell.StatusUnknown, s3.Level())
 }
 
 func TestGroup(t *testing.T) {
@@ -466,3 +537,30 @@ var shutdownOnStartCell = cell.Invoke(func(lc hive.Lifecycle, shutdowner hive.Sh
 			return nil
 		}})
 })
+
+// Assert that we can reuse the same cell as part of multiple hives
+func TestSameCellMultipleHives(t *testing.T) {
+	var (
+		got1 string
+		got2 int
+	)
+
+	common := cell.Group(
+		cell.Config(Config{}),
+		cell.Provide(func() int { return 10 }),
+		cell.Invoke(func(_ Config, in1 string, in2 int) { got1, got2 = in1, in2 }),
+	)
+
+	h1 := hive.New(common, cell.Provide(func() string { return "foo" }))
+	h2 := hive.New(common, cell.Provide(func() string { return "bar" }))
+
+	require.NoError(t, h1.Start(context.TODO()))
+	require.Equal(t, "foo", got1)
+	require.Equal(t, 10, got2)
+	require.NoError(t, h2.Start(context.TODO()))
+	require.Equal(t, "bar", got1)
+	require.Equal(t, 10, got2)
+
+	require.NoError(t, h1.Stop(context.TODO()))
+	require.NoError(t, h1.Stop(context.TODO()))
+}

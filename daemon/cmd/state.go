@@ -14,13 +14,16 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/vishvananda/netlink"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/util/sets"
 
 	"github.com/cilium/cilium/pkg/controller"
 	"github.com/cilium/cilium/pkg/endpoint"
 	"github.com/cilium/cilium/pkg/ipam"
+	"github.com/cilium/cilium/pkg/k8s"
 	slim_corev1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/api/core/v1"
 	"github.com/cilium/cilium/pkg/k8s/watchers/resources"
 	"github.com/cilium/cilium/pkg/labels"
+	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/maps/ctmap"
 	"github.com/cilium/cilium/pkg/maps/lxcmap"
@@ -264,7 +267,7 @@ func (d *Daemon) restoreOldEndpoints(state *endpointRestoreState, clean bool) er
 	return nil
 }
 
-func (d *Daemon) regenerateRestoredEndpoints(state *endpointRestoreState) (restoreComplete chan struct{}) {
+func (d *Daemon) regenerateRestoredEndpoints(state *endpointRestoreState, endpointsRegenerator *endpoint.Regenerator) (restoreComplete chan struct{}) {
 	restoreComplete = make(chan struct{})
 
 	log.WithField("numRestored", len(state.restored)).Info("Regenerating restored endpoints")
@@ -305,8 +308,8 @@ func (d *Daemon) regenerateRestoredEndpoints(state *endpointRestoreState) (resto
 	}
 
 	if option.Config.EnableIPSec {
-		// If IPsec is enabled on EKS or AKS, we need to restore the host
-		// endpoint before any other endpoint, to ensure a dropless upgrade.
+		// If IPsec is enabled we need to restore the host endpoint before any
+		// other endpoint, to ensure a dropless upgrade.
 		// This code can be removed in v1.15.
 		// This is necessary because we changed how the IPsec encapsulation is
 		// done. In older version, bpf_lxc would pass the outer destination IP
@@ -317,9 +320,14 @@ func (d *Daemon) regenerateRestoredEndpoints(state *endpointRestoreState) (resto
 		// for that to succeed, it must be reloaded first, before the bpf_lxc
 		// programs stop writing the IP into skb->cb.
 		for _, ep := range state.restored {
+			// Cap the timeout used to wait for remote cluster synchronization
+			// to avoid blocking the agent startup, as this regeneration is
+			// performed synchronously.
+			endpointsRegenerator.CapTimeoutForSynchronousRegeneration()
+
 			if ep.IsHost() {
 				log.WithField(logfields.EndpointID, ep.ID).Info("Successfully restored endpoint. Scheduling regeneration")
-				if err := ep.RegenerateAfterRestore(); err != nil {
+				if err := ep.RegenerateAfterRestore(endpointsRegenerator); err != nil {
 					log.WithField(logfields.EndpointID, ep.ID).WithError(err).Debug("error regenerating restored host endpoint")
 					epRegenerated <- false
 				} else {
@@ -337,7 +345,7 @@ func (d *Daemon) regenerateRestoredEndpoints(state *endpointRestoreState) (resto
 		}
 		log.WithField(logfields.EndpointID, ep.ID).Info("Successfully restored endpoint. Scheduling regeneration")
 		go func(ep *endpoint.Endpoint, epRegenerated chan<- bool) {
-			if err := ep.RegenerateAfterRestore(); err != nil {
+			if err := ep.RegenerateAfterRestore(endpointsRegenerator); err != nil {
 				log.WithField(logfields.EndpointID, ep.ID).WithError(err).Debug("error regenerating during restore")
 				epRegenerated <- false
 				return
@@ -436,46 +444,72 @@ func (d *Daemon) allocateIPsLocked(ep *endpoint.Endpoint) (err error) {
 	return nil
 }
 
-func (d *Daemon) initRestore(restoredEndpoints *endpointRestoreState) chan struct{} {
+func (d *Daemon) initRestore(restoredEndpoints *endpointRestoreState, endpointsRegenerator *endpoint.Regenerator) chan struct{} {
 	bootstrapStats.restore.Start()
 	var restoreComplete chan struct{}
 	if option.Config.RestoreState {
-		// When we regenerate restored endpoints, it is guaranteed tha we have
+		// When we regenerate restored endpoints, it is guaranteed that we have
 		// received the full list of policies present at the time the daemon
 		// is bootstrapped.
-		restoreComplete = d.regenerateRestoredEndpoints(restoredEndpoints)
-		go func() {
-			<-restoreComplete
-		}()
+		restoreComplete = d.regenerateRestoredEndpoints(restoredEndpoints, endpointsRegenerator)
 
 		go func() {
 			if d.clientset.IsEnabled() {
-				// Also wait for all cluster mesh to be synchronized with the
+				// Configure the controller which removes any leftover Kubernetes
+				// services that may have been deleted while Cilium was not
+				// running. Once this controller succeeds, because it has no
+				// RunInterval specified, it will not run again unless updated
+				// elsewhere. This means that if, for instance, a user manually
+				// adds a service via the CLI into the BPF maps, it will
+				// not be cleaned up by the daemon until it restarts.
+				syncServices := func(localOnly bool) {
+					d.controllers.UpdateController(
+						"sync-lb-maps-with-k8s-services",
+						controller.ControllerParams{
+							Group: syncLBMapsControllerGroup,
+							DoFunc: func(ctx context.Context) error {
+								var localServices sets.Set[k8s.ServiceID]
+								if localOnly {
+									localServices = d.k8sWatcher.K8sSvcCache.LocalServices()
+								}
+
+								stale, err := d.svc.SyncWithK8sFinished(localOnly, localServices)
+
+								// Always process the list of stale services, regardless
+								// of whether an error was returned.
+								swg := lock.NewStoppableWaitGroup()
+								for _, svc := range stale {
+									d.k8sWatcher.K8sSvcCache.EnsureService(svc, swg)
+								}
+
+								swg.Stop()
+								swg.Wait()
+
+								return err
+							},
+							Context: d.ctx,
+						},
+					)
+				}
+
+				// Also wait for all shared services to be synchronized with the
 				// datapath before proceeding.
 				if d.clustermesh != nil {
-					err := d.clustermesh.ClustersSynced(d.ctx)
+					// Do a first pass synchronizing only the services which are not
+					// marked as global, so that we can drop their stale backends
+					// without needing to wait for full clustermesh synchronization.
+					syncServices(true /* only local services */)
+
+					err := d.clustermesh.ServicesSynced(d.ctx)
 					if err != nil {
 						log.WithError(err).Fatal("timeout while waiting for all clusters to be locally synchronized")
 					}
 					log.Debug("all clusters have been correctly synchronized locally")
 				}
-				// Start controller which removes any leftover Kubernetes
-				// services that may have been deleted while Cilium was not
-				// running. Once this controller succeeds, because it has no
-				// RunInterval specified, it will not run again unless updated
-				// elsewhere. This means that if, for instance, a user manually
-				// adds a service via the CLI into the BPF maps, that it will
-				// not be cleaned up by the daemon until it restarts.
-				controller.NewManager().UpdateController(
-					"sync-lb-maps-with-k8s-services",
-					controller.ControllerParams{
-						Group: syncLBMapsControllerGroup,
-						DoFunc: func(ctx context.Context) error {
-							return d.svc.SyncWithK8sFinished(d.k8sWatcher.K8sSvcCache.EnsureService)
-						},
-						Context: d.ctx,
-					},
-				)
+
+				// Now that possible global services have also been synchronized, let's
+				// do a final pass to remove the remaining stale services and backends.
+				syncServices(false /* all services */)
 			}
 		}()
 	} else {

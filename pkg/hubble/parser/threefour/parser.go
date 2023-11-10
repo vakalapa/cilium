@@ -23,6 +23,7 @@ import (
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/monitor"
 	monitorAPI "github.com/cilium/cilium/pkg/monitor/api"
+	"github.com/cilium/cilium/pkg/policy/correlation"
 )
 
 // Parser is a parser for L3/L4 payloads
@@ -185,8 +186,15 @@ func (p *Parser) Decode(data []byte, decoded *pb.Flow) error {
 	}
 
 	srcLabelID, dstLabelID := decodeSecurityIdentities(dn, tn, pvn)
-	srcEndpoint := p.epResolver.ResolveEndpoint(srcIP, srcLabelID)
-	dstEndpoint := p.epResolver.ResolveEndpoint(dstIP, dstLabelID)
+	datapathContext := common.DatapathContext{
+		SrcIP:                 srcIP,
+		SrcLabelID:            srcLabelID,
+		DstIP:                 dstIP,
+		DstLabelID:            dstLabelID,
+		TraceObservationPoint: decoded.TraceObservationPoint,
+	}
+	srcEndpoint := p.epResolver.ResolveEndpoint(srcIP, srcLabelID, datapathContext)
+	dstEndpoint := p.epResolver.ResolveEndpoint(dstIP, dstLabelID, datapathContext)
 	var sourceService, destinationService *pb.Service
 	if p.serviceGetter != nil {
 		sourceService = p.serviceGetter.GetServiceByAddr(srcIP, srcPort)
@@ -217,6 +225,10 @@ func (p *Parser) Decode(data []byte, decoded *pb.Flow) error {
 	decoded.Interface = p.decodeNetworkInterface(tn, dbg)
 	decoded.ProxyPort = decodeProxyPort(dbg, tn)
 	decoded.Summary = summary
+
+	if p.endpointGetter != nil {
+		correlation.CorrelatePolicy(p.endpointGetter, decoded)
+	}
 
 	return nil
 }

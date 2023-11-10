@@ -4,19 +4,19 @@
 package statedb
 
 import (
+	"context"
 	"errors"
-	"fmt"
 	"reflect"
 	"runtime"
 	"strings"
 	"sync/atomic"
-	"time"
 
 	iradix "github.com/hashicorp/go-immutable-radix/v2"
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/cilium/cilium/pkg/hive"
 	"github.com/cilium/cilium/pkg/lock"
+	"github.com/cilium/cilium/pkg/time"
 )
 
 // DB provides an in-memory transaction database built on top of immutable radix
@@ -85,24 +85,28 @@ import (
 //  6. Periodically garbage collect the graveyard by finding
 //     the lowest revision of all delete trackers.
 type DB struct {
-	tables    map[TableName]TableMeta
-	mu        lock.Mutex // sequences modifications to the root tree
-	root      atomic.Pointer[iradix.Tree[tableEntry]]
-	gcTrigger chan struct{} // trigger for graveyard garbage collection
-	gcExited  chan struct{}
-	metrics   Metrics
+	tables              map[TableName]TableMeta
+	ctx                 context.Context
+	cancel              context.CancelFunc
+	mu                  lock.Mutex // sequences modifications to the root tree
+	root                atomic.Pointer[iradix.Tree[tableEntry]]
+	gcTrigger           chan struct{} // trigger for graveyard garbage collection
+	gcExited            chan struct{}
+	gcRateLimitInterval time.Duration
+	metrics             Metrics
 }
 
 func NewDB(tables []TableMeta, metrics Metrics) (*DB, error) {
 	txn := iradix.New[tableEntry]().Txn()
 	db := &DB{
-		tables:  make(map[TableName]TableMeta),
-		metrics: metrics,
+		tables:              make(map[TableName]TableMeta),
+		metrics:             metrics,
+		gcRateLimitInterval: defaultGCRateLimitInterval,
 	}
 	for _, t := range tables {
 		name := t.Name()
 		if _, ok := db.tables[name]; ok {
-			return nil, fmt.Errorf("table %q already exists", name)
+			return nil, tableError(name, ErrDuplicateTable)
 		}
 		db.tables[name] = t
 		var table tableEntry
@@ -175,34 +179,40 @@ func (db *DB) WriteTxn(table TableMeta, tables ...TableMeta) WriteTxn {
 	}).Observe(acquiredAt.Sub(lockAt).Seconds())
 
 	return &txn{
-		db:                     db,
-		rootReadTxn:            rootReadTxn,
-		tables:                 tableEntries,
-		writeTxns:              make(map[tableIndex]*iradix.Txn[object]),
-		smus:                   smus,
-		acquiredAt:             acquiredAt,
-		tableNames:             strings.Join(tableNames, "+"),
-		packageName:            callerPkg,
-		pendingObjectDeltas:    make(map[string]float64),
-		pendingGraveyardDeltas: make(map[string]float64),
+		db:             db,
+		rootReadTxn:    rootReadTxn,
+		modifiedTables: tableEntries,
+		writeTxns:      make(map[tableIndex]*iradix.Txn[object]),
+		smus:           smus,
+		acquiredAt:     acquiredAt,
+		tableNames:     strings.Join(tableNames, "+"),
+		packageName:    callerPkg,
 	}
 }
 
 func (db *DB) Start(hive.HookContext) error {
 	db.gcTrigger = make(chan struct{}, 1)
 	db.gcExited = make(chan struct{})
-	go graveyardWorker(db)
+	db.ctx, db.cancel = context.WithCancel(context.Background())
+	go graveyardWorker(db, db.ctx, db.gcRateLimitInterval)
 	return nil
 }
 
-func (db *DB) Stop(ctx hive.HookContext) error {
+func (db *DB) Stop(stopCtx hive.HookContext) error {
 	close(db.gcTrigger)
+	db.cancel()
 	select {
-	case <-ctx.Done():
+	case <-stopCtx.Done():
 		return errors.New("timed out waiting for graveyard worker to exit")
 	case <-db.gcExited:
 	}
 	return nil
+}
+
+// setGCRateLimitInterval can set the graveyard GC interval before DB is started.
+// Used by tests.
+func (db *DB) setGCRateLimitInterval(interval time.Duration) {
+	db.gcRateLimitInterval = interval
 }
 
 var ciliumPackagePrefix = func() string {

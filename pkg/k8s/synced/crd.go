@@ -8,7 +8,6 @@ package synced
 import (
 	"context"
 	"errors"
-	"time"
 
 	apiextclientset "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -24,9 +23,9 @@ import (
 	"github.com/cilium/cilium/pkg/k8s/client"
 	"github.com/cilium/cilium/pkg/k8s/informer"
 	slim_metav1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/meta/v1"
-	k8sversion "github.com/cilium/cilium/pkg/k8s/version"
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/option"
+	"github.com/cilium/cilium/pkg/time"
 )
 
 const (
@@ -43,7 +42,6 @@ func agentCRDResourceNames() []string {
 		CRDResourceName(v2.CCNPName),
 		CRDResourceName(v2.CNName),
 		CRDResourceName(v2.CIDName),
-		CRDResourceName(v2alpha1.CNCName),
 		CRDResourceName(v2alpha1.CCGName),
 		CRDResourceName(v2alpha1.CPIPName),
 	}
@@ -101,6 +99,7 @@ func AllCiliumCRDResourceNames() []string {
 	return append(
 		AgentCRDResourceNames(),
 		CRDResourceName(v2.CEWName),
+		CRDResourceName(v2alpha1.CNCName),
 	)
 }
 
@@ -173,7 +172,7 @@ func SyncCRDs(ctx context.Context, clientset client.Clientset, crdNames []string
 
 	log.Info("Waiting until all Cilium CRDs are available")
 
-	ticker := time.NewTicker(1 * time.Second)
+	ticker := time.NewTicker(50 * time.Millisecond)
 	for {
 		select {
 		case <-ctx.Done():
@@ -340,21 +339,10 @@ const (
 // client (v1 or v1beta1) in order to retrieve the CRDs in a
 // backwards-compatible way. This implements the cache.Getter interface.
 func (c *crdGetter) Get() *rest.Request {
-	var req *rest.Request
-
-	if k8sversion.Capabilities().APIExtensionsV1CRD {
-		req = c.api.ApiextensionsV1().
-			RESTClient().
-			Get().
-			Name("customresourcedefinitions")
-	} else {
-		req = c.api.ApiextensionsV1beta1().
-			RESTClient().
-			Get().
-			Name("customresourcedefinitions")
-	}
-
-	return req
+	return c.api.ApiextensionsV1().
+		RESTClient().
+		Get().
+		Name("customresourcedefinitions")
 }
 
 type crdGetter struct {

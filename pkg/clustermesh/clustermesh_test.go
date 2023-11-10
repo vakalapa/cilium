@@ -17,17 +17,14 @@ import (
 
 	"github.com/cilium/cilium/pkg/clustermesh/common"
 	"github.com/cilium/cilium/pkg/clustermesh/types"
-	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	cmutils "github.com/cilium/cilium/pkg/clustermesh/utils"
 	"github.com/cilium/cilium/pkg/hive/hivetest"
-	"github.com/cilium/cilium/pkg/identity"
 	"github.com/cilium/cilium/pkg/identity/cache"
 	"github.com/cilium/cilium/pkg/ipcache"
 	"github.com/cilium/cilium/pkg/kvstore"
 	"github.com/cilium/cilium/pkg/kvstore/store"
 	"github.com/cilium/cilium/pkg/lock"
 	nodeStore "github.com/cilium/cilium/pkg/node/store"
-	fakeConfig "github.com/cilium/cilium/pkg/option/fake"
 	"github.com/cilium/cilium/pkg/testutils"
 	testidentity "github.com/cilium/cilium/pkg/testutils/identity"
 )
@@ -97,7 +94,6 @@ func TestClusterMesh(t *testing.T) {
 
 	kvstore.SetupDummy(t, "etcd")
 
-	identity.InitWellKnownIdentities(&fakeConfig.Config{})
 	// The nils are only used by k8s CRD identities. We default to kvstore.
 	mgr := cache.NewCachingIdentityAllocator(&testidentity.IdentityAllocatorOwnerMock{})
 	<-mgr.InitIdentityAllocator(nil)
@@ -111,8 +107,11 @@ func TestClusterMesh(t *testing.T) {
 	// feature. We should be able to connect to such a cluster for
 	// compatibility.
 	for i, name := range []string{"test2", "cluster1", "cluster2"} {
-		config := cmtypes.CiliumClusterConfig{
+		config := types.CiliumClusterConfig{
 			ID: uint32(i + 1),
+			Capabilities: types.CiliumClusterConfigCapabilities{
+				MaxConnectedClusters: 255,
+			},
 		}
 
 		if name == "cluster2" {
@@ -139,9 +138,10 @@ func TestClusterMesh(t *testing.T) {
 	t.Cleanup(func() { ipc.Shutdown() })
 
 	usedIDs := NewClusterMeshUsedIDs()
+	storeFactory := store.NewFactory(store.MetricsProvider())
 	cm := NewClusterMesh(hivetest.Lifecycle(t), Configuration{
 		Config:                common.Config{ClusterMeshConfig: dir},
-		ClusterIDName:         types.ClusterIDName{ClusterID: 255, ClusterName: "test2"},
+		ClusterInfo:           types.ClusterInfo{ID: 255, Name: "test2", MaxConnectedClusters: 255},
 		NodeKeyCreator:        testNodeCreator,
 		NodeObserver:          &testObserver{},
 		RemoteIdentityWatcher: mgr,
@@ -149,11 +149,11 @@ func TestClusterMesh(t *testing.T) {
 		ClusterIDsManager:     usedIDs,
 		Metrics:               NewMetrics(),
 		CommonMetrics:         common.MetricsProvider(subsystem)(),
+		StoreFactory:          storeFactory,
 	})
 	require.NotNil(t, cm, "Failed to initialize clustermesh")
-
 	// cluster2 is the cluster which is tested with sync canaries
-	nodesWSS := store.NewWorkqueueSyncStore("cluster2", kvstore.Client(), nodeStore.NodeStorePrefix)
+	nodesWSS := storeFactory.NewSyncStore("cluster2", kvstore.Client(), nodeStore.NodeStorePrefix)
 	wg.Add(1)
 	go func() {
 		nodesWSS.Run(ctx)
@@ -178,8 +178,11 @@ func TestClusterMesh(t *testing.T) {
 	}, timeout, tick, "Cluster IDs were not reserved correctly")
 
 	// Reconnect cluster with changed ClusterID
-	config := cmtypes.CiliumClusterConfig{
+	config := types.CiliumClusterConfig{
 		ID: 255,
+		Capabilities: types.CiliumClusterConfigCapabilities{
+			MaxConnectedClusters: 255,
+		},
 	}
 	err := cmutils.SetClusterConfig(ctx, "cluster1", &config, kvstore.Client())
 	require.NoErrorf(t, err, "Failed to set cluster config for cluster1")

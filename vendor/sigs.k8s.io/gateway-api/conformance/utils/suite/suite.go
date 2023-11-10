@@ -26,6 +26,7 @@ import (
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	"sigs.k8s.io/gateway-api/apis/v1beta1"
 	"sigs.k8s.io/gateway-api/conformance"
 	"sigs.k8s.io/gateway-api/conformance/utils/config"
 	"sigs.k8s.io/gateway-api/conformance/utils/kubernetes"
@@ -35,35 +36,39 @@ import (
 // ConformanceTestSuite defines the test suite used to run Gateway API
 // conformance tests.
 type ConformanceTestSuite struct {
-	Client            client.Client
-	Clientset         clientset.Interface
-	RESTClient        *rest.RESTClient
-	RestConfig        *rest.Config
-	RoundTripper      roundtripper.RoundTripper
-	GatewayClassName  string
-	ControllerName    string
-	Debug             bool
-	Cleanup           bool
-	BaseManifests     string
-	MeshManifests     string
-	Applier           kubernetes.Applier
-	SupportedFeatures sets.Set[SupportedFeature]
-	TimeoutConfig     config.TimeoutConfig
-	SkipTests         sets.Set[string]
-	FS                embed.FS
+	Client                   client.Client
+	Clientset                clientset.Interface
+	RESTClient               *rest.RESTClient
+	RestConfig               *rest.Config
+	RoundTripper             roundtripper.RoundTripper
+	GatewayClassName         string
+	ControllerName           string
+	Debug                    bool
+	Cleanup                  bool
+	BaseManifests            string
+	MeshManifests            string
+	Applier                  kubernetes.Applier
+	SupportedFeatures        sets.Set[SupportedFeature]
+	TimeoutConfig            config.TimeoutConfig
+	SkipTests                sets.Set[string]
+	RunTest                  string
+	FS                       embed.FS
+	UsableNetworkAddresses   []v1beta1.GatewayAddress
+	UnusableNetworkAddresses []v1beta1.GatewayAddress
 }
 
 // Options can be used to initialize a ConformanceTestSuite.
 type Options struct {
-	Client           client.Client
-	Clientset        clientset.Interface
-	RestConfig       *rest.Config
-	GatewayClassName string
-	Debug            bool
-	RoundTripper     roundtripper.RoundTripper
-	BaseManifests    string
-	MeshManifests    string
-	NamespaceLabels  map[string]string
+	Client               client.Client
+	Clientset            clientset.Interface
+	RestConfig           *rest.Config
+	GatewayClassName     string
+	Debug                bool
+	RoundTripper         roundtripper.RoundTripper
+	BaseManifests        string
+	MeshManifests        string
+	NamespaceLabels      map[string]string
+	NamespaceAnnotations map[string]string
 
 	// CleanupBaseResources indicates whether or not the base test
 	// resources such as Gateways should be cleaned up after the run.
@@ -75,8 +80,19 @@ type Options struct {
 	// SkipTests contains all the tests not to be run and can be used to opt out
 	// of specific tests
 	SkipTests []string
+	// RunTest is a single test to run, mostly for development/debugging convenience.
+	RunTest string
 
 	FS *embed.FS
+
+	// UsableNetworkAddresses is an optional pool of usable addresses for
+	// Gateways for tests which need to test manual address assignments.
+	UsableNetworkAddresses []v1beta1.GatewayAddress
+
+	// UnusableNetworkAddresses is an optional pool of unusable addresses for
+	// Gateways for tests which need to test failures with manual Gateway
+	// address assignment.
+	UnusableNetworkAddresses []v1beta1.GatewayAddress
 }
 
 // New returns a new ConformanceTestSuite.
@@ -89,12 +105,12 @@ func New(s Options) *ConformanceTestSuite {
 	}
 
 	switch {
-	case s.EnableAllSupportedFeatures == true:
+	case s.EnableAllSupportedFeatures:
 		s.SupportedFeatures = AllFeatures
 	case s.SupportedFeatures == nil:
-		s.SupportedFeatures = StandardCoreFeatures
+		s.SupportedFeatures = GatewayCoreFeatures
 	default:
-		for feature := range StandardCoreFeatures {
+		for feature := range GatewayCoreFeatures {
 			s.SupportedFeatures.Insert(feature)
 		}
 	}
@@ -118,12 +134,16 @@ func New(s Options) *ConformanceTestSuite {
 		BaseManifests:    s.BaseManifests,
 		MeshManifests:    s.MeshManifests,
 		Applier: kubernetes.Applier{
-			NamespaceLabels: s.NamespaceLabels,
+			NamespaceLabels:      s.NamespaceLabels,
+			NamespaceAnnotations: s.NamespaceAnnotations,
 		},
-		SupportedFeatures: s.SupportedFeatures,
-		TimeoutConfig:     s.TimeoutConfig,
-		SkipTests:         sets.New(s.SkipTests...),
-		FS:                *s.FS,
+		SupportedFeatures:        s.SupportedFeatures,
+		TimeoutConfig:            s.TimeoutConfig,
+		SkipTests:                sets.New(s.SkipTests...),
+		RunTest:                  s.RunTest,
+		FS:                       *s.FS,
+		UsableNetworkAddresses:   s.UsableNetworkAddresses,
+		UnusableNetworkAddresses: s.UnusableNetworkAddresses,
 	}
 
 	// apply defaults
@@ -141,6 +161,8 @@ func New(s Options) *ConformanceTestSuite {
 // in the cluster. It also ensures that all relevant resources are ready.
 func (suite *ConformanceTestSuite) Setup(t *testing.T) {
 	suite.Applier.FS = suite.FS
+	suite.Applier.UsableNetworkAddresses = suite.UsableNetworkAddresses
+	suite.Applier.UnusableNetworkAddresses = suite.UnusableNetworkAddresses
 
 	if suite.SupportedFeatures.Has(SupportGateway) {
 		t.Logf("Test Setup: Ensuring GatewayClass has been accepted")
@@ -180,7 +202,7 @@ func (suite *ConformanceTestSuite) Setup(t *testing.T) {
 			"gateway-conformance-app-backend",
 			"gateway-conformance-web-backend",
 		}
-		kubernetes.NamespacesMustBeReady(t, suite.Client, suite.TimeoutConfig, namespaces)
+		kubernetes.MeshNamespacesMustBeReady(t, suite.Client, suite.TimeoutConfig, namespaces)
 	}
 }
 
@@ -220,7 +242,7 @@ func (test *ConformanceTest) Run(t *testing.T, suite *ConformanceTestSuite) {
 	}
 
 	// check that the test should not be skipped
-	if suite.SkipTests.Has(test.ShortName) {
+	if suite.SkipTests.Has(test.ShortName) || suite.RunTest != "" && suite.RunTest != test.ShortName {
 		t.Skipf("Skipping %s: test explicitly skipped", test.ShortName)
 	}
 
@@ -245,9 +267,9 @@ func ParseSupportedFeatures(f string) sets.Set[SupportedFeature] {
 	return res
 }
 
-// ParseNamespaceLables parses flag arguments and converts the string to
+// ParseKeyValuePairs parses flag arguments and converts the string to
 // map[string]string containing label key/value pairs.
-func ParseNamespaceLabels(f string) map[string]string {
+func ParseKeyValuePairs(f string) map[string]string {
 	if f == "" {
 		return nil
 	}

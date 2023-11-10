@@ -4,12 +4,10 @@
 package options
 
 import (
-	"github.com/sirupsen/logrus"
-)
+	"fmt"
+	"strings"
 
-const (
-	HttpUrlQuery = "http-url-query"
-	KafkaApiKey  = "kafka-api-key"
+	"github.com/sirupsen/logrus"
 )
 
 // Option is used to configure parsers
@@ -17,9 +15,23 @@ type Option func(*Options)
 
 // Options contains all parser options
 type Options struct {
-	CacheSize         int
-	RedactHTTPQuery   bool
-	RedactKafkaAPIKey bool
+	CacheSize            int
+	HubbleRedactSettings HubbleRedactSettings
+}
+
+// HubbleRedactSettings contains all hubble redact related options
+type HubbleRedactSettings struct {
+	Enabled            bool
+	RedactHTTPQuery    bool
+	RedactHTTPUserInfo bool
+	RedactKafkaAPIKey  bool
+	RedactHttpHeaders  HttpHeadersList
+}
+
+// HttpHeadersList contains the allow/deny list of headers
+type HttpHeadersList struct {
+	Allow map[string]struct{}
+	Deny  map[string]struct{}
 }
 
 // CacheSize configures the amount of L7 requests cached for latency calculation
@@ -30,25 +42,28 @@ func CacheSize(size int) Option {
 }
 
 // Redact configures which data Hubble will redact.
-func Redact(logger logrus.FieldLogger, hubbleRedactOptions []string) Option {
+func Redact(logger logrus.FieldLogger, httpQuery, httpUserInfo, kafkaApiKey bool, allowHeaders, denyHeaders []string) Option {
 	return func(opt *Options) {
-		validOpts := []string{}
-		for _, option := range hubbleRedactOptions {
-			switch option {
-			case HttpUrlQuery:
-				opt.RedactHTTPQuery = true
-			case KafkaApiKey:
-				opt.RedactKafkaAPIKey = true
-			default:
-				if logger != nil {
-					logger.WithField("option", option).Warn("ignoring unknown Hubble redact option")
-				}
-				continue
-			}
-			validOpts = append(validOpts, option)
+		opt.HubbleRedactSettings.Enabled = true
+		opt.HubbleRedactSettings.RedactHTTPQuery = httpQuery
+		opt.HubbleRedactSettings.RedactHTTPUserInfo = httpUserInfo
+		opt.HubbleRedactSettings.RedactKafkaAPIKey = kafkaApiKey
+		opt.HubbleRedactSettings.RedactHttpHeaders = HttpHeadersList{
+			Allow: headerSliceToMap(allowHeaders),
+			Deny:  headerSliceToMap(denyHeaders),
 		}
 		if logger != nil {
-			logger.WithField("options", validOpts).Info("configured Hubble with redact options")
+			logger.WithField(
+				"options",
+				fmt.Sprintf("%+v", opt)).Info("configured Hubble with redact options")
 		}
 	}
+}
+
+func headerSliceToMap(headerList []string) map[string]struct{} {
+	headerMap := make(map[string]struct{}, len(headerList))
+	for _, header := range headerList {
+		headerMap[strings.ToLower(header)] = struct{}{}
+	}
+	return headerMap
 }

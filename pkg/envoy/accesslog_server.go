@@ -11,7 +11,6 @@ import (
 	"net"
 	"os"
 	"syscall"
-	"time"
 
 	cilium "github.com/cilium/proxy/go/cilium/api"
 	"github.com/cilium/proxy/pkg/policy/api/kafka"
@@ -24,6 +23,7 @@ import (
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/proxy/accesslog"
 	"github.com/cilium/cilium/pkg/proxy/logger"
+	"github.com/cilium/cilium/pkg/time"
 )
 
 type AccessLogServer struct {
@@ -162,7 +162,7 @@ func (s *AccessLogServer) handleConn(ctx context.Context, conn *net.UnixConn) {
 			if !request {
 				port = r.SourceEndpoint.Port
 			}
-			localEndpoint.UpdateProxyStatistics("TCP", port, ingress, request, r.Verdict)
+			localEndpoint.UpdateProxyStatistics("envoy", "TCP", port, ingress, request, r.Verdict)
 		}
 	}
 }

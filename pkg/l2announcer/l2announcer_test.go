@@ -6,6 +6,7 @@ package l2announcer
 import (
 	"context"
 	"net/netip"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -27,11 +28,11 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/goleak"
-	"golang.org/x/exp/slices"
 	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/utils/pointer"
 )
 
 type fixture struct {
@@ -44,20 +45,22 @@ type fixture struct {
 
 func newFixture() *fixture {
 	var (
-		tbl statedb.Table[*tables.L2AnnounceEntry]
+		tbl statedb.RWTable[*tables.L2AnnounceEntry]
 		db  *statedb.DB
 		jr  job.Registry
+		sk  cell.Scope
 	)
 
 	hive.New(
 		statedb.Cell,
 		tables.Cell,
 		job.Cell,
-		cell.Invoke(func(d *statedb.DB, t statedb.Table[*tables.L2AnnounceEntry], j job.Registry) {
+		cell.Module("test", "test", cell.Invoke(func(d *statedb.DB, t statedb.RWTable[*tables.L2AnnounceEntry], s cell.Scope, j job.Registry) {
 			db = d
 			tbl = t
 			jr = j
-		}),
+			sk = s
+		})),
 	).Populate()
 
 	fakeSvcStore := &fakeStore[*slim_corev1.Service]{}
@@ -85,7 +88,8 @@ func newFixture() *fixture {
 	announcer := NewL2Announcer(params)
 	announcer.policyStore = fakePolicyStore
 	announcer.svcStore = fakeSvcStore
-	announcer.jobgroup = jr.NewGroup()
+	announcer.jobgroup = jr.NewGroup(sk)
+	announcer.scopedGroup = announcer.jobgroup.Scoped("leader-election")
 	announcer.jobgroup.Start(context.Background())
 
 	return &fixture{
@@ -882,6 +886,60 @@ func TestUpdateService_NoMatch(t *testing.T) {
 
 	svc := blueService()
 	svc.Labels["color"] = "red"
+	fix.fakeSvcStore.slice = append(fix.fakeSvcStore.slice, svc)
+	err := fix.announcer.processSvcEvent(resource.Event[*slim_corev1.Service]{
+		Kind:   resource.Upsert,
+		Key:    resource.NewKey(svc),
+		Object: svc,
+		Done:   func(err error) {},
+	})
+	assert.NoError(t, err)
+
+	// Check that the entry got deleted
+	rtx := fix.stateDB.ReadTxn()
+	iter, _ := fix.proxyNeighborTable.All(rtx)
+	entries := statedb.Collect[*tables.L2AnnounceEntry](iter)
+	assert.Len(t, entries, 0)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	fix.announcer.jobgroup.Stop(ctx)
+	cancel()
+}
+
+// Test that when a service load balancer class is set to a supported value,
+// it matches policies.
+func TestUpdateService_LoadBalancerClassMatch(t *testing.T) {
+	fix := baseUpdateSetup(t)
+
+	svc := blueService()
+	svc.Spec.LoadBalancerClass = pointer.String(v2alpha1.L2AnnounceLoadBalancerClass)
+	fix.fakeSvcStore.slice = append(fix.fakeSvcStore.slice, svc)
+	err := fix.announcer.processSvcEvent(resource.Event[*slim_corev1.Service]{
+		Kind:   resource.Upsert,
+		Key:    resource.NewKey(svc),
+		Object: svc,
+		Done:   func(err error) {},
+	})
+	assert.NoError(t, err)
+
+	// Check that the entry got deleted
+	rtx := fix.stateDB.ReadTxn()
+	iter, _ := fix.proxyNeighborTable.All(rtx)
+	entries := statedb.Collect[*tables.L2AnnounceEntry](iter)
+	assert.Len(t, entries, 1)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	fix.announcer.jobgroup.Stop(ctx)
+	cancel()
+}
+
+// Test that when a service load balancer class is set to an unsupported value,
+// it no longer matches any policies.
+func TestUpdateService_LoadBalancerClassNotMatch(t *testing.T) {
+	fix := baseUpdateSetup(t)
+
+	svc := blueService()
+	svc.Spec.LoadBalancerClass = pointer.String("unsupported.io/lb-class")
 	fix.fakeSvcStore.slice = append(fix.fakeSvcStore.slice, svc)
 	err := fix.announcer.processSvcEvent(resource.Event[*slim_corev1.Service]{
 		Kind:   resource.Upsert,

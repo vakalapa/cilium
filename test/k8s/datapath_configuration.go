@@ -42,7 +42,7 @@ var _ = Describe("K8sDatapathConfig", func() {
 	})
 
 	AfterFailed(func() {
-		kubectl.CiliumReport("cilium status", "cilium endpoint list")
+		kubectl.CiliumReport("cilium-dbg status", "cilium-dbg endpoint list")
 	})
 
 	AfterAll(func() {
@@ -519,31 +519,16 @@ var _ = Describe("K8sDatapathConfig", func() {
 			checkNoLeakP2RemoteService(srcPod, dstPod, srcPodIP.String(), dsSvcIP.String(), true)
 		}
 
-		It("Pod-to-pod traffic is encrypted in tunneling mode with per-endpoint routes", func() {
-			deploymentManager.DeployCilium(map[string]string{
-				"tunnel":                 "vxlan",
-				"ipv6.enabled":           "false",
-				"endpointRoutes.enabled": "true",
-				"encryption.enabled":     "true",
-				"encryption.type":        "wireguard",
-				"l7Proxy":                "false",
-				"ipam.operator.clusterPoolIPv4PodCIDRList": "10.244.0.0/16",
-				"encryption.strictMode.enabled":            "true",
-				"encryption.strictMode.cidr":               "10.244.0.0/16",
-			}, DeployCiliumOptionsAndDNS)
-
-			testStrictWireguard("cilium_vxlan")
-		})
 		It("Pod-to-pod traffic is encrypted in native routing mode with per-endpoint routes", func() {
 			deploymentManager.DeployCilium(map[string]string{
-				"tunnel":                 "disabled",
-				"autoDirectNodeRoutes":   "true",
-				"ipv4NativeRoutingCIDR":  "10.244.0.0/16",
-				"ipv6.enabled":           "false",
-				"endpointRoutes.enabled": "true",
-				"encryption.enabled":     "true",
-				"encryption.type":        "wireguard",
-				"l7Proxy":                "false",
+				"routingMode":                              "native",
+				"autoDirectNodeRoutes":                     "true",
+				"ipv4NativeRoutingCIDR":                    "10.244.0.0/16",
+				"ipv6.enabled":                             "false",
+				"endpointRoutes.enabled":                   "true",
+				"encryption.enabled":                       "true",
+				"encryption.type":                          "wireguard",
+				"l7Proxy":                                  "false",
 				"ipam.operator.clusterPoolIPv4PodCIDRList": "10.244.0.0/16",
 				"encryption.strictMode.enabled":            "true",
 				"encryption.strictMode.cidr":               "10.244.0.0/16",
@@ -555,14 +540,14 @@ var _ = Describe("K8sDatapathConfig", func() {
 		})
 		It("Pod-to-pod traffic is encrypted in native routing mode with per-endpoint routes and overlapping node and pod CIDRs", func() {
 			deploymentManager.DeployCilium(map[string]string{
-				"tunnel":                 "disabled",
-				"autoDirectNodeRoutes":   "true",
-				"ipv4NativeRoutingCIDR":  "192.168.56.0/24",
-				"ipv6.enabled":           "false",
-				"endpointRoutes.enabled": "true",
-				"encryption.enabled":     "true",
-				"encryption.type":        "wireguard",
-				"l7Proxy":                "false",
+				"routingMode":                                     "native",
+				"autoDirectNodeRoutes":                            "true",
+				"ipv4NativeRoutingCIDR":                           "192.168.56.0/24",
+				"ipv6.enabled":                                    "false",
+				"endpointRoutes.enabled":                          "true",
+				"encryption.enabled":                              "true",
+				"encryption.type":                                 "wireguard",
+				"l7Proxy":                                         "false",
 				"ipam.operator.clusterPoolIPv4PodCIDRList":        "192.168.56.128/25",
 				"ipam.operator.clusterPoolIPv4MaskSize":           "26",
 				"encryption.strictMode.enabled":                   "true",
@@ -1143,7 +1128,7 @@ func monitorConnectivityAcrossNodes(kubectl *helpers.Kubectl) (monitorRes *helpe
 	ciliumPodK8s1, err := kubectl.GetCiliumPodOnNode(helpers.K8s1)
 	ExpectWithOffset(1, err).Should(BeNil(), "Cannot get cilium pod on k8s1")
 
-	By(fmt.Sprintf("Launching cilium monitor on %q", ciliumPodK8s1))
+	By(fmt.Sprintf("Launching cilium-dbg monitor on %q", ciliumPodK8s1))
 	monitorRes, monitorCancel = kubectl.MonitorStart(ciliumPodK8s1)
 	result, targetIP := testPodConnectivityAndReturnIP(kubectl, requireMultinode, 2)
 	ExpectWithOffset(1, result).Should(BeTrue(), "Connectivity test between nodes failed")

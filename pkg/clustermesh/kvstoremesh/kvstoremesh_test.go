@@ -17,6 +17,7 @@ import (
 	"github.com/cilium/cilium/pkg/clustermesh/types"
 	"github.com/cilium/cilium/pkg/clustermesh/utils"
 	"github.com/cilium/cilium/pkg/kvstore"
+	"github.com/cilium/cilium/pkg/kvstore/store"
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/testutils"
 )
@@ -40,7 +41,7 @@ type remoteEtcdClientWrapper struct {
 
 // Override the ListAndWatch method so that we can propagate whatever event we want without key conflicts with
 // those eventually created by kvstoremesh. Additionally, this also allows to track which prefixes have been watched.
-func (w *remoteEtcdClientWrapper) ListAndWatch(ctx context.Context, name, prefix string, chanSize int) *kvstore.Watcher {
+func (w *remoteEtcdClientWrapper) ListAndWatch(ctx context.Context, prefix string, chanSize int) *kvstore.Watcher {
 	events := make(kvstore.EventChan, 10)
 
 	w.mu.Lock()
@@ -195,8 +196,8 @@ func TestRemoteClusterRun(t *testing.T) {
 				cached:            tt.srccfg != nil && tt.srccfg.Capabilities.Cached,
 				kvs:               tt.kvs,
 			}
-
-			km := KVStoreMesh{backend: kvstore.Client()}
+			st := store.NewFactory(store.MetricsProvider())
+			km := KVStoreMesh{backend: kvstore.Client(), storeFactory: st}
 			rc := km.newRemoteCluster("foo", nil)
 			ready := make(chan error)
 

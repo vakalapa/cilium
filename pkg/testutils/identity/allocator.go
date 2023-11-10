@@ -25,11 +25,14 @@ func (i *IdentityAllocatorOwnerMock) GetNodeSuffix() string {
 type MockIdentityAllocator struct {
 	cache.IdentityCache
 
-	currentID        int // Regular identities
-	localID          int // CIDR identities
+	// map from scope -> next ID
+	nextIDs map[identity.NumericIdentity]int
+
 	ipToIdentity     map[string]int
 	idToIdentity     map[int]*identity.Identity
 	labelsToIdentity map[string]int // labels are sorted as a key
+
+	withheldIdentities map[identity.NumericIdentity]struct{}
 }
 
 // NewMockIdentityAllocator returns a new mock identity allocator to be used
@@ -42,11 +45,16 @@ func NewMockIdentityAllocator(c cache.IdentityCache) *MockIdentityAllocator {
 	return &MockIdentityAllocator{
 		IdentityCache: c,
 
-		currentID:        1000,
-		localID:          int(identity.LocalIdentityFlag),
-		ipToIdentity:     make(map[string]int),
-		idToIdentity:     make(map[int]*identity.Identity),
-		labelsToIdentity: make(map[string]int),
+		nextIDs: map[identity.NumericIdentity]int{
+			identity.IdentityScopeGlobal:     1000,
+			identity.IdentityScopeLocal:      0,
+			identity.IdentityScopeRemoteNode: 0,
+		},
+
+		ipToIdentity:       make(map[string]int),
+		idToIdentity:       make(map[int]*identity.Identity),
+		labelsToIdentity:   make(map[string]int),
+		withheldIdentities: map[identity.NumericIdentity]struct{}{},
 	}
 }
 
@@ -68,36 +76,33 @@ func (f *MockIdentityAllocator) AllocateIdentity(_ context.Context, lbls labels.
 		return reservedIdentity, false, nil
 	}
 
-	requiresGlobal := identity.RequiresGlobalIdentity(lbls)
-
 	if numID, ok := f.labelsToIdentity[lbls.String()]; ok {
 		id := f.idToIdentity[numID]
 		id.ReferenceCount++
 		return id, false, nil
 	}
 
-	var id int
-	if requiresGlobal {
-		id = f.currentID
-		f.currentID++
-	} else {
-		if _, ok := f.idToIdentity[int(oldNID)]; oldNID.HasLocalScope() && !ok {
-			id = int(oldNID)
-		} else {
-			for {
-				_, ok := f.idToIdentity[f.localID]
-				if !ok {
-					break
-				}
-				f.localID++
-			}
-			id = f.localID
-			f.localID++
+	scope := identity.ScopeForLabels(lbls)
+	id := identity.IdentityUnknown
+
+	// if suggested id is available, use it
+	if scope != identity.IdentityScopeGlobal {
+		if _, ok := f.idToIdentity[int(oldNID)]; !ok && oldNID.Scope() == identity.ScopeForLabels(lbls) {
+			id = oldNID
 		}
+	}
+	for id == identity.IdentityUnknown {
+		candidate := identity.NumericIdentity(f.nextIDs[scope]) | scope
+		_, allocated := f.idToIdentity[int(candidate)]
+		_, withheld := f.withheldIdentities[candidate]
+		if !allocated && !withheld {
+			id = candidate
+		}
+		f.nextIDs[scope]++
 	}
 
 	f.IdentityCache[identity.NumericIdentity(id)] = lbls.LabelArray()
-	f.labelsToIdentity[lbls.String()] = id
+	f.labelsToIdentity[lbls.String()] = int(id)
 
 	realID := &identity.Identity{
 		ID:             identity.NumericIdentity(id),
@@ -105,7 +110,7 @@ func (f *MockIdentityAllocator) AllocateIdentity(_ context.Context, lbls labels.
 		ReferenceCount: 1,
 	}
 	realID.Sanitize() // copy Labels to LabelArray
-	f.idToIdentity[id] = realID
+	f.idToIdentity[int(id)] = realID
 
 	return realID, true, nil
 }
@@ -142,6 +147,18 @@ func (f *MockIdentityAllocator) ReleaseSlice(ctx context.Context, identities []*
 	return nil
 }
 
+func (f *MockIdentityAllocator) WithholdLocalIdentities(nids []identity.NumericIdentity) {
+	for _, nid := range nids {
+		f.withheldIdentities[nid] = struct{}{}
+	}
+}
+
+func (f *MockIdentityAllocator) UnwithholdLocalIdentities(nids []identity.NumericIdentity) {
+	for _, nid := range nids {
+		delete(f.withheldIdentities, nid)
+	}
+}
+
 // LookupIdentity looks up the labels in the mock identity store.
 func (f *MockIdentityAllocator) LookupIdentity(ctx context.Context, lbls labels.Labels) *identity.Identity {
 	if reservedIdentity := identity.LookupReservedIdentityByLabels(lbls); reservedIdentity != nil {
@@ -166,9 +183,9 @@ func (f *MockIdentityAllocator) AllocateCIDRsForIPs(IPs []net.IP, _ map[netip.Pr
 	for _, ip := range IPs {
 		id, ok := f.ipToIdentity[ip.String()]
 		if !ok {
-			id = f.localID
+			id = f.nextIDs[identity.IdentityScopeLocal]
 			f.ipToIdentity[ip.String()] = id
-			f.localID = id + 1
+			f.nextIDs[identity.IdentityScopeLocal]++
 		}
 		cidrLabels := append([]string{}, ip.String())
 		result = append(result, &identity.Identity{

@@ -23,9 +23,6 @@ const (
 	// EndpointGCIntervalDefault is the default time for the CEP GC
 	EndpointGCIntervalDefault = 5 * time.Minute
 
-	// PrometheusServeAddr is the default server address for operator metrics
-	PrometheusServeAddr = ":9963"
-
 	// CESMaxCEPsInCESDefault is the maximum number of cilium endpoints allowed in a CES
 	CESMaxCEPsInCESDefault = 100
 
@@ -103,10 +100,6 @@ const (
 
 	// NodesGCInterval is the duration for which the cilium nodes are GC.
 	NodesGCInterval = "nodes-gc-interval"
-
-	// OperatorPrometheusServeAddr IP:Port on which to serve prometheus
-	// metrics (pass ":Port" to bind on all interfaces, "" is off).
-	OperatorPrometheusServeAddr = "operator-prometheus-serve-addr"
 
 	// SyncK8sServices synchronizes k8s services into the kvstore
 	SyncK8sServices = "synchronize-k8s-services"
@@ -239,55 +232,8 @@ const (
 	// the number of API calls to AlibabaCloud ECS service.
 	AlibabaCloudReleaseExcessIPs = "alibaba-cloud-release-excess-ips"
 
-	// CiliumEndpointSlice options
-
-	// CESMaxCEPsInCES is the maximum number of cilium endpoints allowed in single
-	// a CiliumEndpointSlice resource.
-	CESMaxCEPsInCES = "ces-max-ciliumendpoints-per-ces"
-
-	// CESSlicingMode instructs how CEPs are grouped in a CES.
-	CESSlicingMode = "ces-slice-mode"
-
-	// CESWriteQPSLimit is the rate limit per second for the CES work queue to
-	// process  CES events that result in CES write (Create, Update, Delete)
-	// requests to the kube-apiserver.
-	CESWriteQPSLimit = "ces-write-qps-limit"
-
-	// CESWriteQPSBurst is the burst rate per second used with CESWriteQPSLimit
-	// for the CES work queue to process CES events that result in CES write
-	// (Create, Update, Delete) requests to the kube-apiserver.
-	CESWriteQPSBurst = "ces-write-qps-burst"
-
 	// LoadBalancerL7 enables loadbalancer capabilities for services via envoy proxy
 	LoadBalancerL7 = "loadbalancer-l7"
-
-	// LoadBalancerL7Ports is a list of service ports that will be automatically redirected to backend.
-	LoadBalancerL7Ports = "loadbalancer-l7-ports"
-
-	// LoadBalancerL7Algorithm is a default LB algorithm for services that do not specify related annotation
-	LoadBalancerL7Algorithm = "loadbalancer-l7-algorithm"
-
-	// EnableIngressController enables cilium ingress controller
-	// This must be enabled along with enable-envoy-config in cilium agent.
-	EnableIngressController = "enable-ingress-controller"
-
-	// EnforceIngressHttps enforces https for host having matching TLS host in Ingress.
-	// Incoming traffic to http listener will return 308 http error code with respective location in header.
-	EnforceIngressHttps = "enforce-ingress-https"
-
-	// EnableIngressSecretsSync enables fan-in TLS secrets from multiple namespaces to singular namespace (specified
-	// by ingress-secrets-namespace flag
-	EnableIngressSecretsSync = "enable-ingress-secrets-sync"
-
-	// EnableGatewayAPISecretsSync enables fan-in TLS secrets from multiple namespaces to singular namespace (specified
-	// by gateway-api-secrets-namespace flag
-	EnableGatewayAPISecretsSync = "enable-gateway-api-secrets-sync"
-
-	// IngressSecretsNamespace is the namespace having tls secrets used by Ingress and CEC.
-	IngressSecretsNamespace = "ingress-secrets-namespace"
-
-	// GatewayAPISecretsNamespace is the namespace having tls secrets used by GatewayAPI and CEC.
-	GatewayAPISecretsNamespace = "gateway-api-secrets-namespace"
 
 	// ProxyIdleTimeoutSeconds is the idle timeout for proxy connections to upstream clusters
 	ProxyIdleTimeoutSeconds = "proxy-idle-timeout-seconds"
@@ -315,22 +261,8 @@ const (
 	// nodes.
 	SetCiliumIsUpCondition = "set-cilium-is-up-condition"
 
-	// IngressLBAnnotationPrefixes are the annotations which are needed to propagate
-	// from Ingress to the Load Balancer
-	IngressLBAnnotationPrefixes = "ingress-lb-annotation-prefixes"
-
-	// IngressSharedLBServiceName is the name of shared LB service name for Ingress.
-	IngressSharedLBServiceName = "ingress-shared-lb-service-name"
-
-	// IngressDefaultLoadbalancerMode is the default loadbalancer mode for Ingress.
-	// Applicable values: dedicated, shared
-	IngressDefaultLoadbalancerMode = "ingress-default-lb-mode"
-
-	// IngressDefaultSecretNamespace is the default secret namespace for Ingress.
-	IngressDefaultSecretNamespace = "ingress-default-secret-namespace"
-
-	// IngressDefaultSecretName is the default secret name for Ingress.
-	IngressDefaultSecretName = "ingress-default-secret-name"
+	// IngressDefaultXffNumTrustedHops is the default XffNumTrustedHops value for Ingress.
+	IngressDefaultXffNumTrustedHops = "ingress-default-xff-num-trusted-hops"
 
 	// PodRestartSelector specify the labels contained in the pod that needs to be restarted before the node can be de-stained
 	// default values: k8s-app=kube-dns
@@ -372,8 +304,6 @@ type OperatorConfig struct {
 	// Note that only one node per cluster should run this, and most iterations
 	// will simply return.
 	EndpointGCInterval time.Duration
-
-	OperatorPrometheusServeAddr string
 
 	// SyncK8sServices synchronizes k8s services into the kvstore
 	SyncK8sServices bool
@@ -514,55 +444,11 @@ type OperatorConfig struct {
 	// the number of API calls to AlibabaCloud ECS service.
 	AlibabaCloudReleaseExcessIPs bool
 
-	// CiliumEndpointSlice options
-
-	// CESMaxCEPsInCES is the maximum number of CiliumEndpoints allowed in single
-	// a CiliumEndpointSlice resource.
-	// The default value of maximum CiliumEndpoints allowed in a CiliumEndpointSlice resource is 100.
-	CESMaxCEPsInCES int
-
-	// CESSlicingMode instructs how CEPs are grouped in a CES.
-	CESSlicingMode string
-
-	// CESWriteQPSLimit is the rate limit per second for the CES work queue to
-	// process  CES events that result in CES write (Create, Update, Delete)
-	// requests to the kube-apiserver.
-	CESWriteQPSLimit float64
-
-	// CESWriteQPSBurst is the burst rate per second used with CESWriteQPSLimit
-	// for the CES work queue to process CES events that result in CES write
-	// (Create, Update, Delete) requests to the kube-apiserver.
-	CESWriteQPSBurst int
-
 	// LoadBalancerL7 enables loadbalancer capabilities for services.
 	LoadBalancerL7 string
 
-	// EnvoyLoadBalancerPorts is a list of service ports that will be automatically redirected to Envoy
-	LoadBalancerL7Ports []string
-
-	// LoadBalancerL7Algorithm is a default LB algorithm for services that do not specify related annotation
-	LoadBalancerL7Algorithm string
-
-	// EnableIngressController enables cilium ingress controller
-	EnableIngressController bool
-
 	// EnableGatewayAPI enables support of Gateway API
 	EnableGatewayAPI bool
-
-	// EnforceIngressHTTPS enforces https if required
-	EnforceIngressHTTPS bool
-
-	// EnableIngressSecretsSync enables background TLS secret sync for Ingress
-	EnableIngressSecretsSync bool
-
-	// EnableGatewayAPISecretsSync enables background TLS secret sync for Gateway API
-	EnableGatewayAPISecretsSync bool
-
-	// IngressSecretsNamespace is the namespace having tls secrets used by CEC for Ingress.
-	IngressSecretsNamespace string
-
-	// GatewayAPISecretsNamespace is the namespace having tls secrets used by CEC for Gateway API.
-	GatewayAPISecretsNamespace string
 
 	// ProxyIdleTimeoutSeconds is the idle timeout for the proxy to upstream cluster
 	ProxyIdleTimeoutSeconds int
@@ -586,22 +472,10 @@ type OperatorConfig struct {
 	// nodes.
 	SetCiliumIsUpCondition bool
 
-	// IngressLBAnnotationPrefixes IngressLBAnnotations are the annotation prefixes,
-	// which are used to filter annotations to propagate from Ingress to the Load Balancer
-	IngressLBAnnotationPrefixes []string
-
-	// IngressSharedLBServiceName is the name of shared LB service name for Ingress.
-	IngressSharedLBServiceName string
-
-	// IngressDefaultLoadbalancerMode is the default loadbalancer mode for Ingress.
-	// Applicable values: dedicated, shared
-	IngressDefaultLoadbalancerMode string
-
-	// IngressDefaultLSecretNamespace is the default secret namespace for Ingress.
-	IngressDefaultSecretNamespace string
-
-	// IngressDefaultLSecretName is the default secret name for Ingress.
-	IngressDefaultSecretName string
+	// IngressProxyXffNumTrustedHops The number of additional ingress proxy hops from the right side of the
+	// HTTP header to trust when determining the origin client's IP address.
+	// The default is zero if this option is not specified.
+	IngressProxyXffNumTrustedHops uint32
 
 	// PodRestartSelector specify the labels contained in the pod that needs to be restarted before the node can be de-stained
 	PodRestartSelector string
@@ -617,7 +491,6 @@ func (c *OperatorConfig) Populate(vp *viper.Viper) {
 	c.CNPStatusCleanupBurst = vp.GetInt(CNPStatusCleanupBurst)
 	c.EnableMetrics = vp.GetBool(EnableMetrics)
 	c.EndpointGCInterval = vp.GetDuration(EndpointGCInterval)
-	c.OperatorPrometheusServeAddr = vp.GetString(OperatorPrometheusServeAddr)
 	c.SyncK8sServices = vp.GetBool(SyncK8sServices)
 	c.SyncK8sNodes = vp.GetBool(SyncK8sNodes)
 	c.UnmanagedPodWatcherInterval = vp.GetInt(UnmanagedPodWatcherInterval)
@@ -631,28 +504,16 @@ func (c *OperatorConfig) Populate(vp *viper.Viper) {
 	c.BGPAnnounceLBIP = vp.GetBool(BGPAnnounceLBIP)
 	c.BGPConfigPath = vp.GetString(BGPConfigPath)
 	c.LoadBalancerL7 = vp.GetString(LoadBalancerL7)
-	c.LoadBalancerL7Ports = vp.GetStringSlice(LoadBalancerL7Ports)
-	c.LoadBalancerL7Algorithm = vp.GetString(LoadBalancerL7Algorithm)
-	c.EnableIngressController = vp.GetBool(EnableIngressController)
 	c.EnableGatewayAPI = vp.GetBool(EnableGatewayAPI)
-	c.EnforceIngressHTTPS = vp.GetBool(EnforceIngressHttps)
-	c.IngressSecretsNamespace = vp.GetString(IngressSecretsNamespace)
-	c.GatewayAPISecretsNamespace = vp.GetString(GatewayAPISecretsNamespace)
 	c.ProxyIdleTimeoutSeconds = vp.GetInt(ProxyIdleTimeoutSeconds)
 	if c.ProxyIdleTimeoutSeconds == 0 {
 		c.ProxyIdleTimeoutSeconds = DefaultProxyIdleTimeoutSeconds
 	}
-	c.EnableIngressSecretsSync = vp.GetBool(EnableIngressSecretsSync)
-	c.EnableGatewayAPISecretsSync = vp.GetBool(EnableGatewayAPISecretsSync)
 	c.CiliumPodLabels = vp.GetString(CiliumPodLabels)
 	c.RemoveCiliumNodeTaints = vp.GetBool(RemoveCiliumNodeTaints)
 	c.SetCiliumNodeTaints = vp.GetBool(SetCiliumNodeTaints)
 	c.SetCiliumIsUpCondition = vp.GetBool(SetCiliumIsUpCondition)
-	c.IngressLBAnnotationPrefixes = vp.GetStringSlice(IngressLBAnnotationPrefixes)
-	c.IngressSharedLBServiceName = vp.GetString(IngressSharedLBServiceName)
-	c.IngressDefaultLoadbalancerMode = vp.GetString(IngressDefaultLoadbalancerMode)
-	c.IngressDefaultSecretNamespace = vp.GetString(IngressDefaultSecretNamespace)
-	c.IngressDefaultSecretName = vp.GetString(IngressDefaultSecretName)
+	c.IngressProxyXffNumTrustedHops = vp.GetUint32(IngressDefaultXffNumTrustedHops)
 	c.PodRestartSelector = vp.GetString(PodRestartSelector)
 
 	c.CiliumK8sNamespace = vp.GetString(CiliumK8sNamespace)
@@ -698,12 +559,6 @@ func (c *OperatorConfig) Populate(vp *viper.Viper) {
 
 	c.AlibabaCloudVPCID = vp.GetString(AlibabaCloudVPCID)
 	c.AlibabaCloudReleaseExcessIPs = vp.GetBool(AlibabaCloudReleaseExcessIPs)
-
-	// CiliumEndpointSlice options
-	c.CESMaxCEPsInCES = vp.GetInt(CESMaxCEPsInCES)
-	c.CESSlicingMode = vp.GetString(CESSlicingMode)
-	c.CESWriteQPSLimit = vp.GetFloat64(CESWriteQPSLimit)
-	c.CESWriteQPSBurst = vp.GetInt(CESWriteQPSBurst)
 
 	// Option maps and slices
 

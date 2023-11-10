@@ -10,7 +10,6 @@ import (
 	"net"
 	"net/netip"
 	"sync"
-	"time"
 
 	"github.com/go-openapi/runtime/middleware"
 	"github.com/google/uuid"
@@ -42,6 +41,7 @@ import (
 	"github.com/cilium/cilium/pkg/safetime"
 	"github.com/cilium/cilium/pkg/source"
 	"github.com/cilium/cilium/pkg/stream"
+	"github.com/cilium/cilium/pkg/time"
 	"github.com/cilium/cilium/pkg/trigger"
 )
 
@@ -263,17 +263,6 @@ func (d *Daemon) policyAdd(sourceRules policyAPI.Rules, opts *policy.AddOptions,
 	prefixes := policy.GetCIDRPrefixes(sourceRules)
 	logger.WithField("prefixes", prefixes).Debug("Policy imported via API, found CIDR prefixes...")
 
-	_, err := d.prefixLengths.Add(prefixes)
-	if err != nil {
-		logger.WithError(err).WithField("prefixes", prefixes).Warn(
-			"Failed to reference-count prefix lengths in CIDR policy")
-		resChan <- &PolicyAddResult{
-			newRev: 0,
-			err:    api.Error(PutPolicyFailureCode, err),
-		}
-		return
-	}
-
 	// No errors past this point!
 
 	d.policy.Mutex.Lock()
@@ -343,19 +332,13 @@ func (d *Daemon) policyAdd(sourceRules policyAPI.Rules, opts *policy.AddOptions,
 		metrics.PolicyImplementationDelay.WithLabelValues(source).Observe(duration.Seconds())
 	})
 
-	// Remove prefixes of replaced rules above from the d.prefixLengths tracker.
-	if len(removedPrefixes) > 0 {
-		logger.WithField("prefixes", removedPrefixes).Debug("Decrementing replaced CIDR refcounts when adding rules")
-		d.prefixLengths.Delete(removedPrefixes)
-	}
-
 	logger.WithField(logfields.PolicyRevision, newRev).Info("Policy imported via API, recalculating...")
 
 	labels := make([]string, 0, len(sourceRules))
 	for _, r := range sourceRules {
 		labels = append(labels, r.Labels.GetModel()...)
 	}
-	err = d.SendNotification(monitorAPI.PolicyUpdateMessage(len(sourceRules), labels, newRev))
+	err := d.SendNotification(monitorAPI.PolicyUpdateMessage(len(sourceRules), labels, newRev))
 	if err != nil {
 		logger.WithError(err).WithField(logfields.PolicyRevision, newRev).Warn("Failed to send policy update as monitor notification")
 	}
@@ -585,8 +568,6 @@ func (d *Daemon) policyDelete(labels labels.LabelArray, opts *policy.DeleteOptio
 	prefixes := policy.GetCIDRPrefixes(deletedRules.AsPolicyRules())
 	log.WithField("prefixes", prefixes).Debug("Policy deleted via API, found prefixes...")
 
-	d.prefixLengths.Delete(prefixes)
-
 	// Updates to the datapath are serialized via the policy reaction queue.
 	// This way there is a canonical ordering for policy updates and hence
 	// the subsequent Endpoint regenerations and ipcache updates.
@@ -631,14 +612,12 @@ func deletePolicyHandler(d *Daemon, params DeletePolicyParams) middleware.Respon
 func putPolicyHandler(d *Daemon, params PutPolicyParams) middleware.Responder {
 	var rules policyAPI.Rules
 	if err := json.Unmarshal([]byte(params.Policy), &rules); err != nil {
-		metrics.PolicyImportErrorsTotal.Inc() // Deprecated in Cilium 1.14, to be removed in 1.15.
 		metrics.PolicyChangeTotal.WithLabelValues(metrics.LabelValueOutcomeFail).Inc()
 		return NewPutPolicyInvalidPolicy()
 	}
 
 	for _, r := range rules {
 		if err := r.Sanitize(); err != nil {
-			metrics.PolicyImportErrorsTotal.Inc() // Deprecated in Cilium 1.14, to be removed in 1.15.
 			metrics.PolicyChangeTotal.WithLabelValues(metrics.LabelValueOutcomeFail).Inc()
 			return api.Error(PutPolicyFailureCode, err)
 		}
@@ -656,7 +635,6 @@ func putPolicyHandler(d *Daemon, params PutPolicyParams) middleware.Responder {
 		Source:            source.LocalAPI,
 	})
 	if err != nil {
-		metrics.PolicyImportErrorsTotal.Inc() // Deprecated in Cilium 1.14, to be removed in 1.15.
 		metrics.PolicyChangeTotal.WithLabelValues(metrics.LabelValueOutcomeFail).Inc()
 		return api.Error(PutPolicyFailureCode, err)
 	}

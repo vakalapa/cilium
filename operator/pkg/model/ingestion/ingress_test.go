@@ -603,6 +603,7 @@ var complexIngress = slim_networkingv1.Ingress{
 		Name:        "dummy-ingress",
 		Namespace:   "dummy-namespace",
 		Annotations: testAnnotations,
+		Labels:      testAnnotations,
 		UID:         "d4bd3dc3-2ac5-4ab4-9dca-89c62c60177e",
 	},
 	Spec: slim_networkingv1.IngressSpec{
@@ -1270,6 +1271,21 @@ func useDefaultListenersTLSsecret(listeners []model.HTTPListener) []model.HTTPLi
 	return ret
 }
 
+func removeIngressHTTPRuleValues(ing slim_networkingv1.Ingress) slim_networkingv1.Ingress {
+	var rules []slim_networkingv1.IngressRule
+
+	for _, r := range ing.Spec.Rules {
+		r.HTTP = nil
+		rules = append(rules, r)
+	}
+
+	ret := slim_networkingv1.Ingress{}
+	ing.DeepCopyInto(&ret)
+	ret.Spec.Rules = rules
+
+	return ret
+}
+
 type testcase struct {
 	ingress       slim_networkingv1.Ingress
 	defaultSecret bool
@@ -1277,7 +1293,6 @@ type testcase struct {
 }
 
 func TestIngress(t *testing.T) {
-
 	tests := map[string]testcase{
 		"conformance default backend test": {
 			ingress: defaultBackend,
@@ -1290,6 +1305,10 @@ func TestIngress(t *testing.T) {
 		"conformance default backend (legacy + new) test": {
 			ingress: defaultBackendLegacyOverride,
 			want:    defaultBackendListeners,
+		},
+		"cilium test ingress without http rules": {
+			ingress: removeIngressHTTPRuleValues(hostRules),
+			want:    []model.HTTPListener{},
 		},
 		"conformance host rules test": {
 			ingress: hostRules,
@@ -1379,6 +1398,386 @@ func TestIngress(t *testing.T) {
 				listeners = Ingress(tc.ingress, defaultSecretNamespace, defaultSecretName)
 			} else {
 				listeners = Ingress(tc.ingress, "", "")
+			}
+
+			assert.Equal(t, tc.want, listeners, "Listeners did not match")
+		})
+	}
+}
+
+// SSL Passthrough tests
+//
+// Sources for the SSL Passthrough Ingress objects
+var sslPassthruSources = []model.FullyQualifiedResource{
+	{
+		Name:      "sslpassthru-ingress",
+		Namespace: "dummy-namespace",
+		Version:   "v1",
+		Kind:      "Ingress",
+	},
+}
+
+var emptyTLSListeners = []model.TLSListener{}
+
+// sslPassthru tests basic SSL Passthrough
+var sslPassthru = slim_networkingv1.Ingress{
+	ObjectMeta: slim_metav1.ObjectMeta{
+		Name:      "sslpassthru-ingress",
+		Namespace: "dummy-namespace",
+		Annotations: map[string]string{
+			"ingress.cilium.io/tls-passthrough": "true",
+		},
+	},
+	Spec: slim_networkingv1.IngressSpec{
+		IngressClassName: stringp("cilium"),
+		Rules: []slim_networkingv1.IngressRule{
+			{
+				Host: "sslpassthru.example.com",
+				IngressRuleValue: slim_networkingv1.IngressRuleValue{
+					HTTP: &slim_networkingv1.HTTPIngressRuleValue{
+						Paths: []slim_networkingv1.HTTPIngressPath{
+							{
+								Path: "/",
+								Backend: slim_networkingv1.IngressBackend{
+									Service: &slim_networkingv1.IngressServiceBackend{
+										Name: "dummy-backend",
+										Port: slim_networkingv1.ServiceBackendPort{
+											Number: 8080,
+										},
+									},
+								},
+								PathType: &exactPathType,
+							},
+						},
+					},
+				},
+			},
+		},
+	},
+}
+
+var sslPassthruTLSListeners = []model.TLSListener{
+	{
+		Name:     "ing-sslpassthru-ingress-dummy-namespace-sslpassthru.example.com",
+		Sources:  sslPassthruSources,
+		Port:     443,
+		Hostname: "sslpassthru.example.com",
+		Routes: []model.TLSRoute{
+			{
+				Backends: []model.Backend{
+					{
+						Name:      "dummy-backend",
+						Namespace: "dummy-namespace",
+						Port: &model.BackendPort{
+							Port: 8080,
+						},
+					},
+				},
+			},
+		},
+	},
+}
+
+// sslPassthruNoHost tests when there's no host set
+var sslPassthruNoHost = slim_networkingv1.Ingress{
+	ObjectMeta: slim_metav1.ObjectMeta{
+		Name:      "sslpassthru-ingress",
+		Namespace: "dummy-namespace",
+		Annotations: map[string]string{
+			"ingress.cilium.io/tls-passthrough": "true",
+		},
+	},
+	Spec: slim_networkingv1.IngressSpec{
+		IngressClassName: stringp("cilium"),
+		Rules: []slim_networkingv1.IngressRule{
+			{
+				IngressRuleValue: slim_networkingv1.IngressRuleValue{
+					HTTP: &slim_networkingv1.HTTPIngressRuleValue{
+						Paths: []slim_networkingv1.HTTPIngressPath{
+							{
+								Path: "/",
+								Backend: slim_networkingv1.IngressBackend{
+									Service: &slim_networkingv1.IngressServiceBackend{
+										Name: "dummy-backend",
+										Port: slim_networkingv1.ServiceBackendPort{
+											Number: 8080,
+										},
+									},
+								},
+								PathType: &exactPathType,
+							},
+						},
+					},
+				},
+			},
+		},
+	},
+}
+
+// sslPassthruNoRule tests when there's a hostname but no rule at all
+var sslPassthruNoRule = slim_networkingv1.Ingress{
+	ObjectMeta: slim_metav1.ObjectMeta{
+		Name:      "sslpassthru-ingress",
+		Namespace: "dummy-namespace",
+		Annotations: map[string]string{
+			"ingress.cilium.io/tls-passthrough": "true",
+		},
+	},
+	Spec: slim_networkingv1.IngressSpec{
+		IngressClassName: stringp("cilium"),
+		Rules: []slim_networkingv1.IngressRule{
+			{
+				Host:             "sslpassthru.example.com",
+				IngressRuleValue: slim_networkingv1.IngressRuleValue{},
+			},
+		},
+	},
+}
+
+// sslPassthruExtraPath tests when a hostname and a rule but the path isn't '/'
+var sslPassthruExtraPath = slim_networkingv1.Ingress{
+	ObjectMeta: slim_metav1.ObjectMeta{
+		Name:      "sslpassthru-ingress",
+		Namespace: "dummy-namespace",
+		Annotations: map[string]string{
+			"ingress.cilium.io/tls-passthrough": "true",
+		},
+	},
+	Spec: slim_networkingv1.IngressSpec{
+		IngressClassName: stringp("cilium"),
+		Rules: []slim_networkingv1.IngressRule{
+			{
+				Host: "sslpassthru.example.com",
+				IngressRuleValue: slim_networkingv1.IngressRuleValue{
+					HTTP: &slim_networkingv1.HTTPIngressRuleValue{
+						Paths: []slim_networkingv1.HTTPIngressPath{
+							{
+								Path: "/prefix",
+								Backend: slim_networkingv1.IngressBackend{
+									Service: &slim_networkingv1.IngressServiceBackend{
+										Name: "dummy-backend",
+										Port: slim_networkingv1.ServiceBackendPort{
+											Number: 8080,
+										},
+									},
+								},
+								PathType: &exactPathType,
+							},
+						},
+					},
+				},
+			},
+		},
+	},
+}
+
+// sslPassthruNodePort tests when the Ingress has a NodePort Service set.
+var sslPassthruNodePort = slim_networkingv1.Ingress{
+	ObjectMeta: slim_metav1.ObjectMeta{
+		Name:      "sslpassthru-ingress",
+		Namespace: "dummy-namespace",
+		Annotations: map[string]string{
+			"ingress.cilium.io/service-type":       "NodePort",
+			"ingress.cilium.io/insecure-node-port": "30000",
+			"ingress.cilium.io/secure-node-port":   "30001",
+			"ingress.cilium.io/tls-passthrough":    "true",
+		},
+	},
+	Spec: slim_networkingv1.IngressSpec{
+		IngressClassName: stringp("cilium"),
+		Rules: []slim_networkingv1.IngressRule{
+			{
+				Host: "sslpassthru.example.com",
+				IngressRuleValue: slim_networkingv1.IngressRuleValue{
+					HTTP: &slim_networkingv1.HTTPIngressRuleValue{
+						Paths: []slim_networkingv1.HTTPIngressPath{
+							{
+								Path: "/",
+								Backend: slim_networkingv1.IngressBackend{
+									Service: &slim_networkingv1.IngressServiceBackend{
+										Name: "dummy-backend",
+										Port: slim_networkingv1.ServiceBackendPort{
+											Number: 8080,
+										},
+									},
+								},
+								PathType: &exactPathType,
+							},
+						},
+					},
+				},
+			},
+		},
+	},
+}
+
+var sslPassthruTLSListenersNodePort = []model.TLSListener{
+	{
+		Name:     "ing-sslpassthru-ingress-dummy-namespace-sslpassthru.example.com",
+		Sources:  sslPassthruSources,
+		Port:     443,
+		Hostname: "sslpassthru.example.com",
+		Routes: []model.TLSRoute{
+			{
+				Backends: []model.Backend{
+					{
+						Name:      "dummy-backend",
+						Namespace: "dummy-namespace",
+						Port: &model.BackendPort{
+							Port: 8080,
+						},
+					},
+				},
+			},
+		},
+		Service: &model.Service{
+			Type:             "NodePort",
+			InsecureNodePort: uint32p(30000),
+			SecureNodePort:   uint32p(30001),
+		},
+	},
+}
+
+// sslPassthruMultiplePaths tests when there are multiple paths, with one being '/'
+var sslPassthruMultiplePaths = slim_networkingv1.Ingress{
+	ObjectMeta: slim_metav1.ObjectMeta{
+		Name:      "sslpassthru-ingress",
+		Namespace: "dummy-namespace",
+		Annotations: map[string]string{
+			"ingress.cilium.io/tls-passthrough": "true",
+		},
+	},
+	Spec: slim_networkingv1.IngressSpec{
+		IngressClassName: stringp("cilium"),
+		Rules: []slim_networkingv1.IngressRule{
+			{
+				Host: "sslpassthru.example.com",
+				IngressRuleValue: slim_networkingv1.IngressRuleValue{
+					HTTP: &slim_networkingv1.HTTPIngressRuleValue{
+						Paths: []slim_networkingv1.HTTPIngressPath{
+							{
+								Path: "/prefix",
+								Backend: slim_networkingv1.IngressBackend{
+									Service: &slim_networkingv1.IngressServiceBackend{
+										Name: "dummy-backend",
+										Port: slim_networkingv1.ServiceBackendPort{
+											Number: 8080,
+										},
+									},
+								},
+								PathType: &exactPathType,
+							},
+							{
+								Path: "/",
+								Backend: slim_networkingv1.IngressBackend{
+									Service: &slim_networkingv1.IngressServiceBackend{
+										Name: "dummy-backend",
+										Port: slim_networkingv1.ServiceBackendPort{
+											Number: 8080,
+										},
+									},
+								},
+								PathType: &exactPathType,
+							},
+						},
+					},
+				},
+			},
+		},
+	},
+}
+
+var sslPassthruMultiplePathsTLSListeners = []model.TLSListener{
+	{
+		Name:     "ing-sslpassthru-ingress-dummy-namespace-sslpassthru.example.com",
+		Sources:  sslPassthruSources,
+		Port:     443,
+		Hostname: "sslpassthru.example.com",
+		Routes: []model.TLSRoute{
+			{
+				Backends: []model.Backend{
+					{
+						Name:      "dummy-backend",
+						Namespace: "dummy-namespace",
+						Port: &model.BackendPort{
+							Port: 8080,
+						},
+					},
+				},
+			},
+		},
+	},
+}
+
+// sslPassthruDefaultBackend tests when there's a default backend supplied
+var sslPassthruDefaultBackend = slim_networkingv1.Ingress{
+	ObjectMeta: slim_metav1.ObjectMeta{
+		Name:      "sslpassthru-ingress",
+		Namespace: "dummy-namespace",
+		Annotations: map[string]string{
+			"ingress.cilium.io/tls-passthrough": "true",
+		},
+	},
+	Spec: slim_networkingv1.IngressSpec{
+		IngressClassName: stringp("cilium"),
+		DefaultBackend: &slim_networkingv1.IngressBackend{
+			Service: &slim_networkingv1.IngressServiceBackend{
+				Name: "default-backend",
+				Port: slim_networkingv1.ServiceBackendPort{
+					Number: 8080,
+				},
+			},
+		},
+		Rules: []slim_networkingv1.IngressRule{},
+	},
+}
+
+type passthruTestcase struct {
+	ingress       slim_networkingv1.Ingress
+	defaultSecret bool
+	want          []model.TLSListener
+}
+
+func TestIngressPassthrough(t *testing.T) {
+	tests := map[string]passthruTestcase{
+		"Cilium test ingress with SSL Passthrough": {
+			ingress: sslPassthru,
+			want:    sslPassthruTLSListeners,
+		},
+		"Cilium test ingress with SSL Passthrough, no host set": {
+			ingress: sslPassthruNoHost,
+			want:    emptyTLSListeners,
+		},
+		"Cilium test ingress with SSL Passthrough, host but no rule": {
+			ingress: sslPassthruNoRule,
+			want:    emptyTLSListeners,
+		},
+		"Cilium test ingress with SSL Passthrough, prefix path rule": {
+			ingress: sslPassthruExtraPath,
+			want:    emptyTLSListeners,
+		},
+		"Cilium test ingress with SSL Passthrough and default backend": {
+			ingress: sslPassthruDefaultBackend,
+			want:    emptyTLSListeners,
+		},
+		"Cilium test ingress with SSL Passthrough, multiple path rules, one valid": {
+			ingress: sslPassthruMultiplePaths,
+			want:    sslPassthruMultiplePathsTLSListeners,
+		},
+		"Cilium test ingress with SSL Passthrough, Nodeport Service annotations": {
+			ingress: sslPassthruNodePort,
+			want:    sslPassthruTLSListenersNodePort,
+		},
+	}
+
+	for name, tc := range tests {
+
+		t.Run(name, func(t *testing.T) {
+			var listeners []model.TLSListener
+			if tc.defaultSecret {
+				listeners = IngressPassthrough(tc.ingress, defaultSecretNamespace, defaultSecretName)
+			} else {
+				listeners = IngressPassthrough(tc.ingress, "", "")
 			}
 
 			assert.Equal(t, tc.want, listeners, "Listeners did not match")

@@ -6,7 +6,6 @@ package auth
 import (
 	"context"
 	"fmt"
-	"time"
 
 	"github.com/sirupsen/logrus"
 
@@ -17,6 +16,7 @@ import (
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/maps/authmap"
 	"github.com/cilium/cilium/pkg/policy"
+	"github.com/cilium/cilium/pkg/time"
 )
 
 // signalAuthKey used in the signalmap. Must reflect struct auth_key in the datapath
@@ -110,7 +110,16 @@ func (a *AuthManager) handleCertificateRotationEvent(_ context.Context, event ce
 
 	for k := range all {
 		if k.localIdentity == event.Identity || k.remoteIdentity == event.Identity {
-			a.handleAuthenticationFunc(a, k, true)
+			if event.Deleted {
+				a.logger.
+					WithField("key", k).
+					Debug("Certificate delete event: deleting auth map entry")
+				if err := a.authmap.Delete(k); err != nil {
+					return fmt.Errorf("failed to delete auth map entry: %w", err)
+				}
+			} else {
+				a.handleAuthenticationFunc(a, k, true)
+			}
 		}
 	}
 

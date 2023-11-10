@@ -52,21 +52,6 @@ __encap_and_redirect_with_nodeid(struct __ctx_buff *ctx, __u32 src_ip __maybe_un
 	int ifindex;
 	int ret = 0;
 
-#if defined(ENABLE_WIREGUARD) && __ctx_is == __ctx_skb
-	/* Redirect the packet to the WireGuard tunnel device for encryption
-	 * if needed.
-	 *
-	 * A packet which previously was a subject to VXLAN/Geneve
-	 * encapsulation (e.g., pod2pod) is going to be encapsulated only once,
-	 * i.e., by the WireGuard tunnel netdev. This is so just to be
-	 * compatible with < the v1.13 behavior in which the pod2pod bypassed
-	 * VXLAN/Geneve encapsulation when the WG feature was on.
-	 */
-	ret = wg_maybe_redirect_to_encrypt(ctx);
-	if (IS_ERR(ret) || ret == CTX_ACT_REDIRECT)
-		return ret;
-#endif /* defined(ENABLE_WIREGUARD) && __ctx_is == __ctx_skb */
-
 	ret = __encap_with_nodeid(ctx, src_ip, 0, tunnel_endpoint, seclabel, dstid,
 				  vni, trace->reason, trace->monitor,
 				  &ifindex);
@@ -79,7 +64,7 @@ __encap_and_redirect_with_nodeid(struct __ctx_buff *ctx, __u32 src_ip __maybe_un
 /* encap_and_redirect_with_nodeid returns CTX_ACT_OK after ctx meta-data is
  * set. Caller should pass the ctx to the stack at this point. Otherwise
  * returns CTX_ACT_REDIRECT on successful redirect to tunnel device.
- * On error returns CTX_ACT_DROP or DROP_WRITE_ERROR.
+ * On error returns a DROP_* reason.
  */
 static __always_inline int
 encap_and_redirect_with_nodeid(struct __ctx_buff *ctx, __be32 tunnel_endpoint,
@@ -125,8 +110,8 @@ __encap_and_redirect_lxc(struct __ctx_buff *ctx, __be32 tunnel_endpoint,
 	/* tell caller that this packet needs to go through the stack: */
 	return CTX_ACT_OK;
 #else
-	return __encap_and_redirect_with_nodeid(ctx, 0, tunnel_endpoint,
-						seclabel, dstid, NOT_VTEP_DST, trace);
+	return encap_and_redirect_with_nodeid(ctx, tunnel_endpoint, seclabel,
+					      dstid, trace);
 #endif /* !ENABLE_NODEPORT && ENABLE_HOST_FIREWALL */
 }
 
@@ -137,8 +122,8 @@ __encap_and_redirect_lxc(struct __ctx_buff *ctx, __be32 tunnel_endpoint,
  * the IP stack.
  *
  * Returns CTX_ACT_OK when ctx needs to be handed to IP stack (eg. for IPSec
- * handling), CTX_ACT_DROP, DROP_NO_TUNNEL_ENDPOINT or DROP_WRITE_ERROR on error,
- * and finally on successful redirect returns CTX_ACT_REDIRECT.
+ * handling), a DROP_* reason on error, and finally on successful redirect returns
+ * CTX_ACT_REDIRECT.
  */
 static __always_inline int
 encap_and_redirect_lxc(struct __ctx_buff *ctx,
@@ -176,8 +161,8 @@ encap_and_redirect_lxc(struct __ctx_buff *ctx,
 					 seclabel);
 	}
 # endif
-	return __encap_and_redirect_with_nodeid(ctx, 0, tunnel->ip4, seclabel,
-						dstid, NOT_VTEP_DST, trace);
+	return encap_and_redirect_with_nodeid(ctx, tunnel->ip4, seclabel, dstid,
+					      trace);
 #endif /* ENABLE_HIGH_SCALE_IPCACHE */
 }
 
@@ -191,8 +176,8 @@ encap_and_redirect_netdev(struct __ctx_buff *ctx, struct tunnel_key *k,
 	if (!tunnel)
 		return DROP_NO_TUNNEL_ENDPOINT;
 
-	return __encap_and_redirect_with_nodeid(ctx, 0, tunnel->ip4, seclabel,
-						0, NOT_VTEP_DST, trace);
+	return encap_and_redirect_with_nodeid(ctx, tunnel->ip4, seclabel, 0,
+					      trace);
 }
 #endif /* TUNNEL_MODE || ENABLE_HIGH_SCALE_IPCACHE */
 

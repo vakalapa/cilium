@@ -4,6 +4,7 @@
 package translation
 
 import (
+	"slices"
 	"testing"
 
 	envoy_config_cluster_v3 "github.com/cilium/proxy/go/envoy/config/cluster/v3"
@@ -188,6 +189,38 @@ func TestSharedIngressTranslator_getServices(t *testing.T) {
 	}
 }
 
+func TestSharedIngressTranslator_getHTTPRouteListenerProxy(t *testing.T) {
+	i := &defaultTranslator{
+		name:             "cilium-ingress",
+		namespace:        "kube-system",
+		secretsNamespace: "cilium-secrets",
+		useProxyProtocol: true,
+	}
+	res := i.getHTTPRouteListener(&model.Model{
+		HTTP: []model.HTTPListener{
+			{
+				TLS: []model.TLSSecret{
+					{
+						Name:      "dummy-secret",
+						Namespace: "dummy-namespace",
+					},
+				},
+			},
+		},
+	})
+	require.Len(t, res, 1)
+	listener := &envoy_config_listener.Listener{}
+	err := proto.Unmarshal(res[0].GetValue(), listener)
+	require.NoError(t, err)
+
+	listenerNames := []string{}
+	for _, l := range listener.ListenerFilters {
+		listenerNames = append(listenerNames, l.Name)
+	}
+	slices.Sort(listenerNames)
+	require.Equal(t, []string{proxyProtocolType, tlsInspectorType}, listenerNames)
+}
+
 func TestSharedIngressTranslator_getHTTPRouteListener(t *testing.T) {
 	i := &defaultTranslator{
 		name:             "cilium-ingress",
@@ -262,7 +295,7 @@ func TestSharedIngressTranslator_getClusters(t *testing.T) {
 				m: defaultBackendModel,
 			},
 			expected: []string{
-				"random-namespace/default-backend:8080",
+				"random-namespace:default-backend:8080",
 			},
 		},
 		{
@@ -271,8 +304,8 @@ func TestSharedIngressTranslator_getClusters(t *testing.T) {
 				m: hostRulesModel,
 			},
 			expected: []string{
-				"random-namespace/foo-bar-com:http",
-				"random-namespace/wildcard-foo-com:8080",
+				"random-namespace:foo-bar-com:http",
+				"random-namespace:wildcard-foo-com:8080",
 			},
 		},
 		{
@@ -281,12 +314,12 @@ func TestSharedIngressTranslator_getClusters(t *testing.T) {
 				m: pathRulesModel,
 			},
 			expected: []string{
-				"random-namespace/aaa-prefix:8080",
-				"random-namespace/aaa-slash-bbb-prefix:8080",
-				"random-namespace/aaa-slash-bbb-slash-prefix:8080",
-				"random-namespace/foo-exact:8080",
-				"random-namespace/foo-prefix:8080",
-				"random-namespace/foo-slash-exact:8080",
+				"random-namespace:aaa-prefix:8080",
+				"random-namespace:aaa-slash-bbb-prefix:8080",
+				"random-namespace:aaa-slash-bbb-slash-prefix:8080",
+				"random-namespace:foo-exact:8080",
+				"random-namespace:foo-prefix:8080",
+				"random-namespace:foo-slash-exact:8080",
 			},
 		},
 		{
@@ -295,9 +328,9 @@ func TestSharedIngressTranslator_getClusters(t *testing.T) {
 				m: complexIngressModel,
 			},
 			expected: []string{
-				"dummy-namespace/another-dummy-backend:8081",
-				"dummy-namespace/default-backend:8080",
-				"dummy-namespace/dummy-backend:8080",
+				"dummy-namespace:another-dummy-backend:8081",
+				"dummy-namespace:default-backend:8080",
+				"dummy-namespace:dummy-backend:8080",
 			},
 		},
 	}

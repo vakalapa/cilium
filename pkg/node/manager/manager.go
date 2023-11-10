@@ -9,15 +9,15 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
-	"time"
+
+	"slices"
 
 	"github.com/cilium/workerpool"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/sirupsen/logrus"
-	"golang.org/x/exp/slices"
 
 	"github.com/cilium/cilium/pkg/backoff"
 	"github.com/cilium/cilium/pkg/controller"
-	"github.com/cilium/cilium/pkg/datapath/iptables"
 	datapath "github.com/cilium/cilium/pkg/datapath/types"
 	"github.com/cilium/cilium/pkg/hive"
 	"github.com/cilium/cilium/pkg/hive/cell"
@@ -36,6 +36,7 @@ import (
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/rand"
 	"github.com/cilium/cilium/pkg/source"
+	"github.com/cilium/cilium/pkg/time"
 )
 
 var (
@@ -124,12 +125,15 @@ type manager struct {
 	// ipcache is the set operations performed against the ipcache
 	ipcache IPCache
 
+	// ipsetMgr is the ipset cluster nodes configuration manager
+	ipsetMgr ipsetManager
+
 	// controllerManager manages the controllers that are launched within the
 	// Manager.
 	controllerManager *controller.Manager
 
-	// healthReporter reports on the current health status of the node manager module.
-	healthReporter cell.HealthReporter
+	// healthScope reports on the current health status of the node manager module.
+	healthScope cell.Scope
 }
 
 // Subscribe subscribes the given node handler to node events.
@@ -183,6 +187,31 @@ type nodeMetrics struct {
 	DatapathValidations metric.Counter
 }
 
+// ProcessNodeDeletion upon node deletion ensures metrics associated
+// with the deleted node are no longer reported.
+// Notably for metrics node connectivity status and latency metrics
+func (*nodeMetrics) ProcessNodeDeletion(clusterName, nodeName string) {
+	// Removes all connectivity status associated with the deleted node.
+	_ = metrics.NodeConnectivityStatus.DeletePartialMatch(prometheus.Labels{
+		metrics.LabelSourceCluster:  clusterName,
+		metrics.LabelSourceNodeName: nodeName,
+	})
+	_ = metrics.NodeConnectivityStatus.DeletePartialMatch(prometheus.Labels{
+		metrics.LabelTargetCluster:  clusterName,
+		metrics.LabelTargetNodeName: nodeName,
+	})
+
+	// Removes all connectivity latency associated with the deleted node.
+	_ = metrics.NodeConnectivityLatency.DeletePartialMatch(prometheus.Labels{
+		metrics.LabelSourceCluster:  clusterName,
+		metrics.LabelSourceNodeName: nodeName,
+	})
+	_ = metrics.NodeConnectivityLatency.DeletePartialMatch(prometheus.Labels{
+		metrics.LabelTargetCluster:  clusterName,
+		metrics.LabelTargetNodeName: nodeName,
+	})
+}
+
 func NewNodeMetrics() *nodeMetrics {
 	return &nodeMetrics{
 		EventsReceived: metric.NewCounterVec(metric.CounterOpts{
@@ -212,15 +241,16 @@ func NewNodeMetrics() *nodeMetrics {
 }
 
 // New returns a new node manager
-func New(c Configuration, ipCache IPCache, nodeMetrics *nodeMetrics, healthReporter cell.HealthReporter) (*manager, error) {
+func New(c Configuration, ipCache IPCache, ipsetMgr ipsetManager, nodeMetrics *nodeMetrics, healthScope cell.Scope) (*manager, error) {
 	m := &manager{
 		nodes:             map[nodeTypes.Identity]*nodeEntry{},
 		conf:              c,
 		controllerManager: controller.NewManager(),
 		nodeHandlers:      map[datapath.NodeHandler]struct{}{},
 		ipcache:           ipCache,
+		ipsetMgr:          ipsetMgr,
 		metrics:           nodeMetrics,
-		healthReporter:    healthReporter,
+		healthScope:       healthScope,
 	}
 
 	return m, nil
@@ -321,10 +351,11 @@ func (m *manager) backgroundSync(ctx context.Context) error {
 			m.metrics.DatapathValidations.Inc()
 		}
 
+		hr := cell.GetHealthReporter(m.healthScope, "background-sync")
 		if errs != nil {
-			m.healthReporter.Degraded("Failed to apply node validation", errs)
+			hr.Degraded("Failed to apply node validation", errs)
 		} else {
-			m.healthReporter.OK("Node validation successful")
+			hr.OK("Node validation successful")
 		}
 
 		select {
@@ -385,6 +416,22 @@ func (m *manager) nodeIdentityLabels(n nodeTypes.Node) (nodeLabels labels.Labels
 	if m.conf.RemoteNodeIdentitiesEnabled() {
 		if n.IsLocal() {
 			nodeLabels = labels.NewFrom(labels.LabelHost)
+			if option.Config.PolicyCIDRMatchesNodes() {
+				for _, address := range n.IPAddresses {
+					addr, ok := ip.AddrFromIP(address.IP)
+					if ok {
+						bitLen := addr.BitLen()
+						if option.Config.EnableIPv4 && bitLen == net.IPv4len*8 ||
+							option.Config.EnableIPv6 && bitLen == net.IPv6len*8 {
+							prefix, err := addr.Prefix(bitLen)
+							if err == nil {
+								cidrLabels := labels.GetCIDRLabels(prefix)
+								nodeLabels.MergeLabels(cidrLabels)
+							}
+						}
+					}
+				}
+			}
 		} else if !identity.NumericIdentity(n.NodeIdentity).IsReservedIdentity() {
 			// This needs to match clustermesh-apiserver's VMManager.AllocateNodeIdentity
 			nodeLabels = labels.Map2Labels(n.Labels, labels.LabelSourceK8s)
@@ -423,7 +470,7 @@ func (m *manager) NodeUpdated(n nodeTypes.Node) {
 
 	for _, address := range n.IPAddresses {
 		if option.Config.NodeIpsetNeeded() && address.Type == addressing.NodeInternalIP {
-			iptables.AddToNodeIpset(address.IP)
+			m.ipsetMgr.AddToNodeIpset(address.IP)
 		}
 
 		if m.nodeAddressSkipsIPCache(address) {
@@ -455,10 +502,17 @@ func (m *manager) NodeUpdated(n nodeTypes.Node) {
 			dpUpdate = false
 		}
 
+		lbls := nodeLabels
+		// Add the CIDR labels for this node, if we allow selecting nodes by CIDR
+		if option.Config.PolicyCIDRMatchesNodes() {
+			lbls = labels.NewFrom(nodeLabels)
+			lbls.MergeLabels(labels.GetCIDRLabels(prefix))
+		}
+
 		// Always associate the prefix with metadata, even though this may not
 		// end up in an ipcache entry.
 		m.ipcache.UpsertMetadata(prefix, n.Source, resource,
-			nodeLabels,
+			lbls,
 			ipcacheTypes.TunnelPeer{Addr: tunnelIP},
 			ipcacheTypes.EncryptKey(key))
 		if nodeIdentityOverride {
@@ -518,6 +572,7 @@ func (m *manager) NodeUpdated(n nodeTypes.Node) {
 		oldNode := entry.node
 		entry.node = n
 		if dpUpdate {
+			var errs error
 			m.Iter(func(nh datapath.NodeHandler) {
 				if err := nh.NodeUpdate(oldNode, entry.node); err != nil {
 					log.WithFields(logrus.Fields{
@@ -525,8 +580,16 @@ func (m *manager) NodeUpdated(n nodeTypes.Node) {
 						"node":    entry.node.Name,
 					}).WithError(err).
 						Error("Failed to handle node update event while applying handler. Cilium may be have degraded functionality. See error message for details.")
+					errs = errors.Join(errs, err)
 				}
 			})
+
+			hr := cell.GetHealthReporter(m.healthScope, "nodes-update")
+			if errs != nil {
+				hr.Degraded("Failed to update nodes", errs)
+			} else {
+				hr.OK("Node updates successful")
+			}
 		}
 
 		m.removeNodeFromIPCache(oldNode, resource, nodeIPsAdded, healthIPsAdded, ingressIPsAdded)
@@ -540,6 +603,7 @@ func (m *manager) NodeUpdated(n nodeTypes.Node) {
 		entry.mutex.Lock()
 		m.nodes[nodeIdentifier] = entry
 		m.mutex.Unlock()
+		var errs error
 		if dpUpdate {
 			m.Iter(func(nh datapath.NodeHandler) {
 				if err := nh.NodeAdd(entry.node); err != nil {
@@ -548,10 +612,18 @@ func (m *manager) NodeUpdated(n nodeTypes.Node) {
 						"handler": nh.Name(),
 					}).WithError(err).
 						Error("Failed to handle node update event while applying handler. Cilium may be have degraded functionality. See error message for details.")
+					errs = errors.Join(errs, err)
 				}
 			})
 		}
 		entry.mutex.Unlock()
+		hr := cell.GetHealthReporter(m.healthScope, "nodes-add")
+		if errs != nil {
+			hr.Degraded("Failed to add nodes", errs)
+		} else {
+			hr.OK("Node adds successful")
+		}
+
 	}
 }
 
@@ -577,7 +649,7 @@ func (m *manager) removeNodeFromIPCache(oldNode nodeTypes.Node, resource ipcache
 		}
 
 		if option.Config.NodeIpsetNeeded() && address.Type == addressing.NodeInternalIP {
-			iptables.RemoveFromNodeIpset(address.IP)
+			m.ipsetMgr.RemoveFromNodeIpset(address.IP)
 		}
 
 		if m.nodeAddressSkipsIPCache(address) {
@@ -668,10 +740,12 @@ func (m *manager) NodeDeleted(n nodeTypes.Node) {
 	m.removeNodeFromIPCache(entry.node, resource, nil, nil, nil)
 
 	m.metrics.NumNodes.Dec()
+	m.metrics.ProcessNodeDeletion(n.Cluster, n.Name)
 
 	entry.mutex.Lock()
 	delete(m.nodes, nodeIdentifier)
 	m.mutex.Unlock()
+	var errs error
 	m.Iter(func(nh datapath.NodeHandler) {
 		if err := nh.NodeDelete(n); err != nil {
 			// For now we log the error and continue. Eventually we will want to encorporate
@@ -682,9 +756,17 @@ func (m *manager) NodeDeleted(n nodeTypes.Node) {
 				"handler": nh.Name(),
 				"node":    n.Name,
 			}).WithError(err).Error("Failed to handle node delete event while applying handler. Cilium may be have degraded functionality.")
+			errs = errors.Join(errs, err)
 		}
 	})
 	entry.mutex.Unlock()
+
+	hr := cell.GetHealthReporter(m.healthScope, "nodes-delete")
+	if errs != nil {
+		hr.Degraded("Failed to delete nodes", errs)
+	} else {
+		hr.OK("Node deletions successful")
+	}
 }
 
 // GetNodeIdentities returns a list of all node identities store in node

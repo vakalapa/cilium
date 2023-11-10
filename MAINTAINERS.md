@@ -2,7 +2,9 @@
 
 See [Governance](Documentation/community/governance/commit_access.rst) for
 governance, commit, and vote guidelines as well as committer responsibilities.
-Everybody listed is a committer as per governance definition.
+Everybody listed is a committer as per governance definition. See the 
+[Contributor Ladder](https://github.com/cilium/community/blob/main/CONTRIBUTOR-LADDER.md)
+to learn how to level up through the project.
 
 ## Cilium Committers
 
@@ -19,7 +21,6 @@ Everybody listed is a committer as per governance definition.
  * [Dan Wendlandt] (Isovalent)
  * [Deepesh Pathak]
  * [Dylan Reimerink] (Isovalent)
- * [Eloy Coto] (Red Hat)
  * [Gilberto Bertin] (Isovalent)
  * [Glib Smaga] (Isovalent)
  * [Hemanth Malla] (Datadog)
@@ -60,6 +61,7 @@ Everybody listed is a committer as per governance definition.
 
 We would like to acknowledge previous committers and their huge contributions to our collective success:
 
+ * [Eloy Coto] (Red Hat)
  * [Ilya Dmitrichenko] (Docker)
  * [Ray Bejjani]
  * [Tom Payne]

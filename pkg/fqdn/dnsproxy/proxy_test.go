@@ -19,7 +19,7 @@ import (
 	"time"
 
 	. "github.com/cilium/checkmate"
-	"github.com/miekg/dns"
+	"github.com/cilium/dns"
 	"golang.org/x/exp/maps"
 	"sigs.k8s.io/yaml"
 
@@ -157,15 +157,15 @@ var (
 	testSelectorCache       = policy.NewSelectorCache(fakeAllocator, cacheAllocator.GetIdentityCache())
 	dummySelectorCacheUser  = &DummySelectorCacheUser{}
 	DstID1Selector          = api.NewESFromLabels(labels.ParseSelectLabel("k8s:Dst1=test"))
-	cachedDstID1Selector, _ = testSelectorCache.AddIdentitySelector(dummySelectorCacheUser, DstID1Selector)
+	cachedDstID1Selector, _ = testSelectorCache.AddIdentitySelector(dummySelectorCacheUser, nil, DstID1Selector)
 	DstID2Selector          = api.NewESFromLabels(labels.ParseSelectLabel("k8s:Dst2=test"))
-	cachedDstID2Selector, _ = testSelectorCache.AddIdentitySelector(dummySelectorCacheUser, DstID2Selector)
+	cachedDstID2Selector, _ = testSelectorCache.AddIdentitySelector(dummySelectorCacheUser, nil, DstID2Selector)
 	DstID3Selector          = api.NewESFromLabels(labels.ParseSelectLabel("k8s:Dst3=test"))
-	cachedDstID3Selector, _ = testSelectorCache.AddIdentitySelector(dummySelectorCacheUser, DstID3Selector)
+	cachedDstID3Selector, _ = testSelectorCache.AddIdentitySelector(dummySelectorCacheUser, nil, DstID3Selector)
 	DstID4Selector          = api.NewESFromLabels(labels.ParseSelectLabel("k8s:Dst4=test"))
-	cachedDstID4Selector, _ = testSelectorCache.AddIdentitySelector(dummySelectorCacheUser, DstID4Selector)
+	cachedDstID4Selector, _ = testSelectorCache.AddIdentitySelector(dummySelectorCacheUser, nil, DstID4Selector)
 
-	cachedWildcardSelector, _ = testSelectorCache.AddIdentitySelector(dummySelectorCacheUser, api.WildcardEndpointSelector)
+	cachedWildcardSelector, _ = testSelectorCache.AddIdentitySelector(dummySelectorCacheUser, nil, api.WildcardEndpointSelector)
 
 	epID1   = uint64(111)
 	epID2   = uint64(222)
@@ -193,9 +193,9 @@ func (s *DNSProxyTestSuite) SetUpTest(c *C) {
 	s.dnsServer = setupServer(c)
 	c.Assert(s.dnsServer, Not(IsNil), Commentf("unable to setup DNS server"))
 
-	proxy, err := StartDNSProxy("", 0, true, 1000, // any address, any port, enable compression, max 1000 restore IPs
+	proxy, err := StartDNSProxy("", 0, true, true, true, 1000, // any address, any port, enable ipv4, enable ipv6, enable compression, max 1000 restore IPs
 		// LookupEPByIP
-		func(ip net.IP) (*endpoint.Endpoint, error) {
+		func(ip netip.Addr) (*endpoint.Endpoint, error) {
 			if s.restoring {
 				return nil, fmt.Errorf("No EPs available when restoring")
 			}
@@ -1092,7 +1092,11 @@ type selectorMock struct {
 	key string
 }
 
-func (t selectorMock) GetSelections() []identity.NumericIdentity {
+func (t selectorMock) GetSelections() identity.NumericIdentitySlice {
+	panic("implement me")
+}
+
+func (t selectorMock) GetMetadataLabels() labels.LabelArray {
 	panic("implement me")
 }
 

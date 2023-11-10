@@ -5,10 +5,10 @@ package auth
 
 import (
 	"fmt"
-	"time"
 
 	"github.com/cilium/cilium/pkg/identity"
 	"github.com/cilium/cilium/pkg/policy"
+	"github.com/cilium/cilium/pkg/time"
 )
 
 // authMap provides an abstraction for the BPF map "auth"
@@ -18,6 +18,7 @@ type authMap interface {
 	DeleteIf(predicate func(key authKey, info authInfo) bool) error
 	Get(key authKey) (authInfo, error)
 	All() (map[authKey]authInfo, error)
+	MaxEntries() uint32
 }
 
 type authMapCacher interface {

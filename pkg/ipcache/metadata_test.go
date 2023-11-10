@@ -16,7 +16,6 @@ import (
 	"github.com/cilium/cilium/pkg/identity/cache"
 	"github.com/cilium/cilium/pkg/ipcache/types"
 	"github.com/cilium/cilium/pkg/labels"
-	"github.com/cilium/cilium/pkg/labels/cidr"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/source"
 	testidentity "github.com/cilium/cilium/pkg/testutils/identity"
@@ -42,6 +41,14 @@ func TestInjectLabels(t *testing.T) {
 
 	ctx := context.Background()
 
+	// disable policy-cidr-selects-nodes, which affects identity management
+	oldVal := option.Config.PolicyCIDRMatchMode
+	defer func() {
+		option.Config.PolicyCIDRMatchMode = oldVal
+	}()
+
+	option.Config.PolicyCIDRMatchMode = []string{}
+
 	assert.Len(t, IPIdentityCache.metadata.m, 1)
 	remaining, err := IPIdentityCache.InjectLabels(ctx, []netip.Prefix{worldPrefix})
 	assert.Len(t, remaining, 0)
@@ -60,7 +67,7 @@ func TestInjectLabels(t *testing.T) {
 
 	// Upsert node labels to the kube-apiserver to validate that the CIDR ID is
 	// deallocated and the kube-apiserver reserved ID is associated with this
-	// IP now.
+	// IP now (unless we are enabling policy-cidr-match-mode=remote-node).
 	IPIdentityCache.metadata.upsertLocked(inClusterPrefix, source.CustomResource, "node-uid", labels.LabelRemoteNode)
 	assert.Len(t, IPIdentityCache.metadata.m, 2)
 	remaining, err = IPIdentityCache.InjectLabels(ctx, []netip.Prefix{inClusterPrefix})
@@ -68,11 +75,81 @@ func TestInjectLabels(t *testing.T) {
 	assert.Len(t, remaining, 0)
 	assert.Len(t, IPIdentityCache.ipToIdentityCache, 2)
 	assert.False(t, IPIdentityCache.ipToIdentityCache["10.0.0.4/32"].ID.HasLocalScope())
+	assert.Equal(t, identity.ReservedIdentityKubeAPIServer, IPIdentityCache.ipToIdentityCache["10.0.0.4/32"].ID)
+
+	// Insert another node, see that it gets the RemoteNode ID but not kube-apiserver
+	IPIdentityCache.metadata.upsertLocked(inClusterPrefix2, source.CustomResource, "node-uid", labels.LabelRemoteNode)
+	assert.Len(t, IPIdentityCache.metadata.m, 3)
+	remaining, err = IPIdentityCache.InjectLabels(ctx, []netip.Prefix{inClusterPrefix2})
+	assert.NoError(t, err)
+	assert.Len(t, remaining, 0)
+	assert.Len(t, IPIdentityCache.ipToIdentityCache, 3)
+	assert.Equal(t, identity.ReservedIdentityRemoteNode, IPIdentityCache.ipToIdentityCache["10.0.0.5/32"].ID)
+
+	// Enable policy-cidr-selects-nodes, ensure that node now has a separate identity (in the node id scope)
+	option.Config.PolicyCIDRMatchMode = []string{"nodes"}
+
+	// Insert CIDR labels for the remote nodes (this is done by the node manager, but we need to test that it goes through)
+	IPIdentityCache.metadata.upsertLocked(inClusterPrefix, source.CustomResource, "node-uid-cidr", labels.GetCIDRLabels(inClusterPrefix))
+	IPIdentityCache.metadata.upsertLocked(inClusterPrefix2, source.CustomResource, "node-uid-cidr", labels.GetCIDRLabels(inClusterPrefix2))
+
+	remaining, err = IPIdentityCache.InjectLabels(ctx, []netip.Prefix{inClusterPrefix, inClusterPrefix2})
+	assert.NoError(t, err)
+	assert.Len(t, remaining, 0)
+	assert.Len(t, IPIdentityCache.ipToIdentityCache, 3)
+	nid1 := IPIdentityCache.ipToIdentityCache["10.0.0.4/32"].ID
+	nid2 := IPIdentityCache.ipToIdentityCache["10.0.0.5/32"].ID
+	assert.Equal(t, identity.IdentityScopeRemoteNode, nid1.Scope())
+	assert.Equal(t, identity.IdentityScopeRemoteNode, nid2.Scope())
+
+	// Ensure that all expected labels have been allocated
+	// -- prefix1 should have kube-apiserver, remote-node, and cidr
+	// -- prefix2 should have remote-node and cidr
+	id1 := IPIdentityCache.IdentityAllocator.LookupIdentityByID(ctx, nid1)
+	assert.NotNil(t, id1)
+	assert.True(t, id1.Labels.Has(labels.LabelRemoteNode[labels.IDNameRemoteNode]))
+	assert.True(t, id1.Labels.Has(labels.LabelKubeAPIServer[labels.IDNameKubeAPIServer]))
+	assert.True(t, id1.Labels.Has(labels.ParseLabel("cidr:10.0.0.4/32")))
+	assert.False(t, id1.Labels.Has(labels.ParseLabel("cidr:10.0.0.5/32")))
+
+	id2 := IPIdentityCache.IdentityAllocator.LookupIdentityByID(ctx, nid2)
+	assert.NotNil(t, id2)
+	assert.True(t, id2.Labels.Has(labels.LabelRemoteNode[labels.IDNameRemoteNode]))
+	assert.False(t, id2.Labels.Has(labels.LabelKubeAPIServer[labels.IDNameKubeAPIServer]))
+	assert.False(t, id2.Labels.Has(labels.ParseLabel("cidr:10.0.0.4/32")))
+	assert.True(t, id2.Labels.Has(labels.ParseLabel("cidr:10.0.0.5/32")))
+
+	// Remove remote-node label, ensure transition to local cidr identity space
+	IPIdentityCache.metadata.remove(inClusterPrefix, "node-uid", overrideIdentity(false), labels.LabelRemoteNode)
+	IPIdentityCache.metadata.remove(inClusterPrefix2, "node-uid", overrideIdentity(false), labels.LabelRemoteNode)
+	remaining, err = IPIdentityCache.InjectLabels(ctx, []netip.Prefix{inClusterPrefix, inClusterPrefix2})
+	assert.NoError(t, err)
+	assert.Len(t, remaining, 0)
+
+	nid1 = IPIdentityCache.ipToIdentityCache["10.0.0.4/32"].ID
+	nid2 = IPIdentityCache.ipToIdentityCache["10.0.0.5/32"].ID
+	assert.Equal(t, identity.IdentityScopeLocal, nid1.Scope())
+	assert.Equal(t, identity.IdentityScopeLocal, nid2.Scope())
+
+	id1 = IPIdentityCache.IdentityAllocator.LookupIdentityByID(ctx, nid1)
+	assert.NotNil(t, id1)
+	assert.False(t, id1.Labels.Has(labels.LabelRemoteNode[labels.IDNameRemoteNode]))
+	assert.True(t, id1.Labels.Has(labels.LabelKubeAPIServer[labels.IDNameKubeAPIServer]))
+	assert.True(t, id1.Labels.Has(labels.ParseLabel("cidr:10.0.0.4/32")))
+	assert.False(t, id1.Labels.Has(labels.ParseLabel("cidr:10.0.0.5/32")))
+
+	id2 = IPIdentityCache.IdentityAllocator.LookupIdentityByID(ctx, nid2)
+	assert.NotNil(t, id2)
+	assert.False(t, id2.Labels.Has(labels.LabelRemoteNode[labels.IDNameRemoteNode]))
+	assert.False(t, id2.Labels.Has(labels.LabelKubeAPIServer[labels.IDNameKubeAPIServer]))
+	assert.False(t, id2.Labels.Has(labels.ParseLabel("cidr:10.0.0.4/32")))
+	assert.True(t, id2.Labels.Has(labels.ParseLabel("cidr:10.0.0.5/32")))
 
 	// Clean up.
-	IPIdentityCache.metadata.remove(inClusterPrefix, "node-uid", overrideIdentity(false), labels.LabelRemoteNode)
+	IPIdentityCache.metadata.remove(inClusterPrefix, "node-uid-cidr", overrideIdentity(false), labels.Labels{})
+	IPIdentityCache.metadata.remove(inClusterPrefix2, "node-uid-cidr", overrideIdentity(false), labels.Labels{})
 	IPIdentityCache.metadata.remove(inClusterPrefix, "kube-uid", overrideIdentity(false), labels.LabelKubeAPIServer)
-	remaining, err = IPIdentityCache.InjectLabels(ctx, []netip.Prefix{inClusterPrefix})
+	remaining, err = IPIdentityCache.InjectLabels(ctx, []netip.Prefix{inClusterPrefix, inClusterPrefix2})
 	assert.NoError(t, err)
 	assert.Len(t, remaining, 0)
 	assert.Len(t, IPIdentityCache.metadata.m, 1)
@@ -158,29 +235,113 @@ func TestInjectLabels(t *testing.T) {
 	option.Config.EnableIPv6 = true
 }
 
+// Test that when multiple IPs have the `resolved:host` label, we correctly
+// aggregate all labels *and* update the selector cache correctly.
+// This reproduces GH-28259.
+func TestUpdateLocalNode(t *testing.T) {
+	cancel := setupTest(t)
+	defer cancel()
+
+	ctx := context.Background()
+
+	bothLabels := labels.Labels{}
+	bothLabels.MergeLabels(labels.LabelHost)
+	bothLabels.MergeLabels(labels.LabelKubeAPIServer)
+
+	selectorCacheHas := func(lbls labels.Labels) {
+		t.Helper()
+		id := PolicyHandler.identities[identity.ReservedIdentityHost]
+		assert.NotNil(t, id)
+		assert.Equal(t, lbls.LabelArray(), id)
+	}
+
+	injectLabels := func(ip netip.Prefix) {
+		t.Helper()
+		remaining, err := IPIdentityCache.InjectLabels(ctx, []netip.Prefix{ip})
+		assert.NoError(t, err)
+		assert.Len(t, remaining, 0)
+	}
+
+	idIs := func(ip netip.Prefix, id identity.NumericIdentity) {
+		t.Helper()
+		assert.Equal(t, IPIdentityCache.ipToIdentityCache[ip.String()].ID, id)
+	}
+
+	// Mark .4 as local host
+	IPIdentityCache.metadata.upsertLocked(inClusterPrefix, source.Local, "node-uid", labels.LabelHost)
+	injectLabels(inClusterPrefix)
+	idIs(inClusterPrefix, identity.ReservedIdentityHost)
+	selectorCacheHas(labels.LabelHost)
+
+	// Mark .4 as kube-apiserver
+	// Note that in the actual code, we use `source.KubeAPIServer`. However,
+	// we use the same source in test case to try and ferret out more bugs.
+	IPIdentityCache.metadata.upsertLocked(inClusterPrefix, source.Local, "kube-uid", labels.LabelKubeAPIServer)
+	injectLabels(inClusterPrefix)
+	idIs(inClusterPrefix, identity.ReservedIdentityHost)
+	selectorCacheHas(bothLabels)
+
+	// Mark .5 as local host
+	IPIdentityCache.metadata.upsertLocked(inClusterPrefix2, source.Local, "node-uid", labels.LabelHost)
+	injectLabels(inClusterPrefix2)
+	idIs(inClusterPrefix, identity.ReservedIdentityHost)
+	idIs(inClusterPrefix2, identity.ReservedIdentityHost)
+	selectorCacheHas(bothLabels)
+
+	// remove kube-apiserver from .4
+	IPIdentityCache.metadata.remove(inClusterPrefix, "kube-uid", labels.LabelKubeAPIServer)
+	injectLabels(inClusterPrefix)
+	idIs(inClusterPrefix, identity.ReservedIdentityHost)
+	idIs(inClusterPrefix2, identity.ReservedIdentityHost)
+	selectorCacheHas(labels.LabelHost)
+
+	// add kube-apiserver back to .4
+	IPIdentityCache.metadata.upsertLocked(inClusterPrefix, source.Local, "kube-uid", labels.LabelKubeAPIServer)
+	injectLabels(inClusterPrefix)
+	idIs(inClusterPrefix, identity.ReservedIdentityHost)
+	idIs(inClusterPrefix2, identity.ReservedIdentityHost)
+	selectorCacheHas(bothLabels)
+
+	// remove host from .4
+	IPIdentityCache.metadata.remove(inClusterPrefix, "node-uid", labels.LabelHost)
+	injectLabels(inClusterPrefix)
+
+	// Verify that .4 now has just kube-apiserver and CIDRs
+	idIs(inClusterPrefix, identity.IdentityScopeLocal) // the first CIDR identity
+	id := PolicyHandler.identities[identity.IdentityScopeLocal]
+	assert.True(t, id.Has("reserved.kube-apiserver"))
+	assert.True(t, id.Has("cidr."+inClusterPrefix.String()))
+
+	// verify that id 1 is now just reserved:host
+	idIs(inClusterPrefix2, identity.ReservedIdentityHost)
+	selectorCacheHas(labels.LabelHost)
+}
+
 // TestInjectExisting tests "upgrading" an existing identity to the apiserver.
-// This is a common occurrence on startup - and this tests ensures we don't
-// regress the known issue in GH-24502
+// This is possible if a CIDR policy references a given IP, which is then
+// upgraded to the apiserver.
+//
+// This was intended to ensure we don't regress on GH-24502, but that is moot
+// now that identity restoration happens using the asynch apis.
 func TestInjectExisting(t *testing.T) {
 	cancel := setupTest(t)
 	defer cancel()
 
-	// mimic the "restore cidr" logic from daemon.go
-	// for every ip -> identity mapping in the bpf ipcache
-	// - allocate that identity
-	// - insert the cidr=>identity mapping back in to the go ipcache
-	identities := make(map[netip.Prefix]*identity.Identity)
+	// mimic fqdn policy:
+	// - identitiesForFQDNSelectorIPs calls AllocateCIDRsForIPs()
+	// - notifyOnDNSMsg calls UpsertGeneratedIdentities())
+	newlyAllocatedIdentities := make(map[netip.Prefix]*identity.Identity)
 	prefix := netip.MustParsePrefix("172.19.0.5/32")
-	oldID := identity.NumericIdentity(16777219)
-	_, err := IPIdentityCache.AllocateCIDRs([]netip.Prefix{prefix}, []identity.NumericIdentity{oldID}, identities)
+	_, err := IPIdentityCache.AllocateCIDRsForIPs([]net.IP{prefix.Addr().AsSlice()}, newlyAllocatedIdentities)
 	assert.NoError(t, err)
 
-	IPIdentityCache.UpsertGeneratedIdentities(identities, nil)
+	IPIdentityCache.UpsertGeneratedIdentities(newlyAllocatedIdentities, nil)
 
 	// sanity check: ensure the cidr is correctly in the ipcache
+	wantID := identity.IdentityScopeLocal
 	id, ok := IPIdentityCache.LookupByIP(prefix.String())
 	assert.True(t, ok)
-	assert.Equal(t, int32(16777219), int32(id.ID))
+	assert.Equal(t, wantID, id.ID)
 
 	// Simulate the first half of UpsertLabels -- insert the labels only in to the metadata cache
 	// This is to "force" a race condition
@@ -188,27 +349,30 @@ func TestInjectExisting(t *testing.T) {
 		types.ResourceKindEndpoint, "default", "kubernetes")
 	IPIdentityCache.metadata.upsertLocked(prefix, source.KubeAPIServer, resource, labels.LabelKubeAPIServer)
 
-	// Now, emulate policyAdd(), which calls AllocateCIDRs()
-	_, err = IPIdentityCache.AllocateCIDRs([]netip.Prefix{prefix}, []identity.NumericIdentity{oldID}, nil)
+	// Now, emulate a ToServices policy, which calls AllocateCIDRs
+	_, err = IPIdentityCache.AllocateCIDRs([]netip.Prefix{prefix}, nil)
 	assert.NoError(t, err)
 
-	// Now, trigger label injection
-	// This will allocate a new ID for the same /32 since the labels have changed
-	IPIdentityCache.UpsertLabels(prefix, labels.LabelKubeAPIServer, source.KubeAPIServer, resource)
-
-	// Need to wait for the label injector to finish; easiest just to remove it
-	IPIdentityCache.controllers.RemoveControllerAndWait(LabelInjectorName)
+	// Now, the second half of UpsertLabels -- identity injection
+	remaining, err := IPIdentityCache.InjectLabels(context.Background(), []netip.Prefix{prefix})
+	assert.NoError(t, err)
+	assert.Len(t, remaining, 0)
 
 	// Ensure the source is now correctly understood in the ipcache
 	id, ok = IPIdentityCache.LookupByIP(prefix.String())
 	assert.True(t, ok)
 	assert.Equal(t, source.KubeAPIServer, id.Source)
+
+	// Ensure the SelectorCache has the correct labels
+	selectorID := PolicyHandler.identities[id.ID]
+	assert.NotNil(t, selectorID)
+	assert.True(t, selectorID.Contains(labels.LabelKubeAPIServer.LabelArray()))
 }
 
 // TestInjectWithLegacyAPIOverlap tests that a previously allocated identity
 // will continue to be used in the ipcache even if other users of newer APIs
 // also use the API, and that reference counting is properly balanced for this
-// pattern.This is a common occurrence on startup - and this tests ensures we
+// pattern. This is a common occurrence on startup - and this tests ensures we
 // don't regress the known issue in GH-24502
 //
 // This differs from TestInjectExisting() by reusing the same identity, and by
@@ -217,33 +381,33 @@ func TestInjectWithLegacyAPIOverlap(t *testing.T) {
 	cancel := setupTest(t)
 	defer cancel()
 
-	// mimic the "restore cidr" logic from daemon.go
-	// for every ip -> identity mapping in the bpf ipcache
-	// - allocate that identity
-	// - insert the cidr=>identity mapping back in to the go ipcache
-	identities := make(map[netip.Prefix]*identity.Identity)
+	// mimic fqdn policy:
+	// - identitiesForFQDNSelectorIPs calls AllocateCIDRsForIPs()
+	// - notifyOnDNSMsg calls UpsertGeneratedIdentities())
+	newlyAllocatedIdentities := make(map[netip.Prefix]*identity.Identity)
 	prefix := netip.MustParsePrefix("172.19.0.5/32")
-	oldID := identity.NumericIdentity(16777219)
-	_, err := IPIdentityCache.AllocateCIDRs([]netip.Prefix{prefix}, []identity.NumericIdentity{oldID}, identities)
+	_, err := IPIdentityCache.AllocateCIDRsForIPs([]net.IP{prefix.Addr().AsSlice()}, newlyAllocatedIdentities)
 	assert.NoError(t, err)
 	identityReferences := 1
 
-	IPIdentityCache.UpsertGeneratedIdentities(identities, nil)
+	wantID := newlyAllocatedIdentities[prefix].ID
+
+	IPIdentityCache.UpsertGeneratedIdentities(newlyAllocatedIdentities, nil)
 
 	// sanity check: ensure the cidr is correctly in the ipcache
 	id, ok := IPIdentityCache.LookupByIP(prefix.String())
 	assert.True(t, ok)
-	assert.Equal(t, int32(16777219), int32(id.ID))
+	assert.Equal(t, wantID, id.ID)
 
 	// Simulate the first half of UpsertLabels -- insert the labels only in to the metadata cache
 	// This is to "force" a race condition
 	resource := types.NewResourceID(
 		types.ResourceKindCNP, "default", "policy")
-	labels := cidr.GetCIDRLabels(prefix)
+	labels := labels.GetCIDRLabels(prefix)
 	IPIdentityCache.metadata.upsertLocked(prefix, source.CustomResource, resource, labels)
 
-	// Now, emulate policyAdd(), which calls AllocateCIDRs()
-	_, err = IPIdentityCache.AllocateCIDRs([]netip.Prefix{prefix}, []identity.NumericIdentity{oldID}, nil)
+	// Now, emulate a ToServices policy, which calls AllocateCIDRs
+	_, err = IPIdentityCache.AllocateCIDRs([]netip.Prefix{prefix}, nil)
 	assert.NoError(t, err)
 	identityReferences++
 
@@ -276,7 +440,7 @@ func TestInjectWithLegacyAPIOverlap(t *testing.T) {
 	// sanity check: ensure the cidr is correctly in the ipcache
 	id, ok = IPIdentityCache.LookupByIP(prefix.String())
 	assert.True(t, ok)
-	assert.Equal(t, oldID.Uint32(), id.ID.Uint32())
+	assert.Equal(t, wantID, id.ID)
 
 	// Check that the corresponding identity in the identity allocator
 	// is still allocated, which implies that it's reference counted
@@ -294,6 +458,47 @@ func TestInjectWithLegacyAPIOverlap(t *testing.T) {
 	// Assert that ipcache has released its final reference to the identity
 	realID = IPIdentityCache.IdentityAllocator.LookupIdentityByID(context.Background(), id.ID)
 	assert.True(t, realID == nil)
+}
+
+// This test ensures that the ipcache does the right thing when legacy and new
+// APIs are interleaved, with the legacy call happening *second*, temporally.
+func TestInjectLegacySecond(t *testing.T) {
+	cancel := setupTest(t)
+	defer cancel()
+
+	prefix := netip.MustParsePrefix("172.19.0.5/32")
+	resource := types.NewResourceID(
+		types.ResourceKindCNP, "default", "policy")
+	labels := labels.GetCIDRLabels(prefix)
+
+	IPIdentityCache.metadata.upsertLocked(prefix, source.Generated, resource, labels)
+	remaining, err := IPIdentityCache.InjectLabels(context.Background(), []netip.Prefix{prefix})
+	assert.NoError(t, err)
+	assert.Len(t, remaining, 0)
+
+	id, ok := IPIdentityCache.LookupByIP(prefix.String())
+	assert.True(t, ok)
+	wantID := id.ID
+
+	// Allocate via old APIs
+	newlyAllocatedIdentities := make(map[netip.Prefix]*identity.Identity)
+	currentlyAllocatedIdentities, err := IPIdentityCache.AllocateCIDRsForIPs([]net.IP{prefix.Addr().AsSlice()}, newlyAllocatedIdentities)
+	assert.NoError(t, err)
+	assert.Len(t, newlyAllocatedIdentities, 0)
+	assert.Len(t, currentlyAllocatedIdentities, 1)
+	assert.Equal(t, wantID, currentlyAllocatedIdentities[0].ID)
+	IPIdentityCache.UpsertGeneratedIdentities(newlyAllocatedIdentities, currentlyAllocatedIdentities)
+
+	// Remove via new APIs
+	IPIdentityCache.metadata.remove(prefix, resource, labels)
+	remaining, err = IPIdentityCache.InjectLabels(context.Background(), []netip.Prefix{prefix})
+	assert.NoError(t, err)
+	assert.Len(t, remaining, 0)
+
+	// Ensure the ipcache still has the correct ID
+	id, ok = IPIdentityCache.LookupByIP(prefix.String())
+	assert.True(t, ok)
+	assert.Equal(t, wantID, id.ID)
 }
 
 func TestFilterMetadataByLabels(t *testing.T) {
@@ -346,7 +551,7 @@ func TestRemoveLabelsFromIPs(t *testing.T) {
 	assert.Len(t, remaining, 0)
 	id := IPIdentityCache.IdentityAllocator.LookupIdentityByID(
 		context.TODO(),
-		identity.LocalIdentityFlag, // we assume first local ID
+		identity.IdentityScopeLocal, // we assume first local ID
 	)
 	assert.NotNil(t, id)
 	assert.Equal(t, 1, id.ReferenceCount)
@@ -383,7 +588,7 @@ func TestOverrideIdentity(t *testing.T) {
 
 	ipc := NewIPCache(&Configuration{
 		IdentityAllocator: allocator,
-		PolicyHandler:     &mockUpdater{},
+		PolicyHandler:     newMockUpdater(),
 		DatapathHandler:   &mockTriggerer{},
 	})
 	ctx := context.Background()
@@ -526,19 +731,60 @@ func TestUpsertMetadataTunnelPeerAndEncryptKey(t *testing.T) {
 	assert.Equal(t, uint8(6), key)
 }
 
+// TestRequestIdentity checks that the identity restoration mechanism works as expected:
+// -- requested numeric identities are utilized
+// -- if two prefixes somehow collide, everything still works
+func TestRequestIdentity(t *testing.T) {
+	cancel := setupTest(t)
+	cancel()
+
+	injectLabels := func(prefixes ...netip.Prefix) {
+		t.Helper()
+		remaining, err := IPIdentityCache.InjectLabels(context.Background(), prefixes)
+		assert.NoError(t, err)
+		assert.Len(t, remaining, 0)
+	}
+
+	hasIdentity := func(prefix netip.Prefix, nid identity.NumericIdentity) {
+		t.Helper()
+		id, _ := IPIdentityCache.LookupByPrefix(prefix.String())
+		assert.EqualValues(t, nid, id.ID)
+	}
+
+	// Add 2 prefixes in to the ipcache, one requesting the first local identity
+	IPIdentityCache.metadata.upsertLocked(inClusterPrefix, source.Restored, "daemon-uid", types.RequestedIdentity(identity.IdentityScopeLocal))
+	IPIdentityCache.metadata.upsertLocked(inClusterPrefix2, source.Restored, "daemon-uid", labels.Labels{})
+
+	// Withhold the first local-scoped identity in the allocator
+	IPIdentityCache.IdentityAllocator.WithholdLocalIdentities([]identity.NumericIdentity{16777216})
+
+	// Upsert the second prefix first, ensuring it does not get the withheld identituy
+	injectLabels(inClusterPrefix2)
+	injectLabels(inClusterPrefix)
+
+	hasIdentity(inClusterPrefix, identity.IdentityScopeLocal)
+	hasIdentity(inClusterPrefix2, identity.IdentityScopeLocal+1)
+
+	// Attach the restored nid to another prefix, ensure it is ignored
+	IPIdentityCache.metadata.upsertLocked(aPrefix, source.Restored, "daemon-uid", types.RequestedIdentity(identity.IdentityScopeLocal))
+	injectLabels(aPrefix)
+	hasIdentity(aPrefix, identity.IdentityScopeLocal+2)
+}
+
 func setupTest(t *testing.T) (cleanup func()) {
 	t.Helper()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	allocator := testidentity.NewMockIdentityAllocator(nil)
+	PolicyHandler = newMockUpdater()
 	IPIdentityCache = NewIPCache(&Configuration{
 		Context:           ctx,
 		IdentityAllocator: allocator,
-		PolicyHandler:     &mockUpdater{},
+		PolicyHandler:     PolicyHandler,
 		DatapathHandler:   &mockTriggerer{},
 	})
 
-	IPIdentityCache.metadata.upsertLocked(worldPrefix, source.CustomResource, "kube-uid", labels.LabelKubeAPIServer)
+	IPIdentityCache.metadata.upsertLocked(worldPrefix, source.KubeAPIServer, "kube-uid", labels.LabelKubeAPIServer)
 	IPIdentityCache.metadata.upsertLocked(worldPrefix, source.Local, "host-uid", labels.LabelHost)
 
 	return func() {
@@ -547,9 +793,25 @@ func setupTest(t *testing.T) (cleanup func()) {
 	}
 }
 
-type mockUpdater struct{}
+func newMockUpdater() *mockUpdater {
+	return &mockUpdater{
+		identities: make(map[identity.NumericIdentity]labels.LabelArray),
+	}
+}
 
-func (m *mockUpdater) UpdateIdentities(_, _ cache.IdentityCache, _ *sync.WaitGroup) {}
+type mockUpdater struct {
+	identities map[identity.NumericIdentity]labels.LabelArray
+}
+
+func (m *mockUpdater) UpdateIdentities(added, deleted cache.IdentityCache, _ *sync.WaitGroup) {
+	for nid, lbls := range added {
+		m.identities[nid] = lbls
+	}
+
+	for nid := range deleted {
+		delete(m.identities, nid)
+	}
+}
 
 type mockTriggerer struct{}
 

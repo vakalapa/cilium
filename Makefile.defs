@@ -28,6 +28,7 @@ LOCALSTATEDIR?=/var
 RUNDIR?=/var/run
 CONFDIR?=/etc
 
+export GO ?= go
 NATIVE_ARCH = $(shell GOARCH= $(GO) env GOARCH)
 export GOARCH ?= $(NATIVE_ARCH)
 
@@ -65,7 +66,6 @@ endif
 CONSUL_IMAGE=consul:1.7.2
 
 export CILIUM_CLI ?= cilium
-export GO ?= go
 export KUBECTL ?= kubectl
 
 # go build/test/clean flags
@@ -95,9 +95,9 @@ endif
 endif
 
 # renovate: datasource=docker depName=golangci/golangci-lint
-GOLANGCILINT_WANT_VERSION = v1.54.2
-GOLANGCILINT_IMAGE_SHA = sha256:2082f5379c48c46e447bc1b890512f3aa9339db5eeed1a483a34aae9476ba6ee
-GOLANGCILINT_VERSION = $(shell golangci-lint version 2>/dev/null)
+GOLANGCILINT_WANT_VERSION = v1.55.1
+GOLANGCILINT_IMAGE_SHA = sha256:c4e67eb904109ade78e2f38d98a424502f016db5676409390469bcdafea0f57d
+GOLANGCILINT_VERSION = $(shell golangci-lint version --format short 2>/dev/null)
 
 VERSION = $(shell cat $(dir $(lastword $(MAKEFILE_LIST)))/VERSION)
 VERSION_MAJOR = $(shell cat $(dir $(lastword $(MAKEFILE_LIST)))/VERSION | cut -d. -f1)
@@ -141,7 +141,7 @@ CILIUM_DATAPATH_SHA256=$(shell cd $(ROOT_DIR); cat $(BPF_SRCFILES) | sha256sum |
 GO_BUILD_LDFLAGS += -X "github.com/cilium/cilium/pkg/datapath/loader.DatapathSHA256=$(CILIUM_DATAPATH_SHA256)"
 
 GO_BUILD_FLAGS += -mod=vendor
-GO_TEST_FLAGS += -mod=vendor
+GO_TEST_FLAGS += -mod=vendor -vet=all
 GO_CLEAN_FLAGS += -mod=vendor
 
 GO_BUILD = CGO_ENABLED=0 $(GO) build

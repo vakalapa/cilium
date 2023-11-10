@@ -379,9 +379,8 @@ static __always_inline int reverse_map_l4_port(struct __ctx_buff *ctx, __u8 next
 			int ret;
 
 			/* Port offsets for UDP and TCP are the same */
-			ret = l4_load_port(ctx, l4_off + TCP_SPORT_OFF, &old_port);
-			if (IS_ERR(ret))
-				return ret;
+			if (l4_load_port(ctx, l4_off + TCP_SPORT_OFF, &old_port) < 0)
+				return DROP_INVALID;
 
 			if (port != old_port) {
 #ifdef ENABLE_SCTP
@@ -870,7 +869,7 @@ static __always_inline int lb6_local(const void *map, struct __ctx_buff *ctx,
 
 	/* See lb4_local comments re svc endpoint lookup process */
 	ret = ct_lazy_lookup6(map, tuple, ctx, l4_off, CT_SERVICE,
-			      SCOPE_REVERSE, state, &monitor);
+			      SCOPE_REVERSE, CT_ENTRY_ANY, state, &monitor);
 	switch (ret) {
 	case CT_NEW:
 #ifdef ENABLE_SESSION_AFFINITY
@@ -1194,14 +1193,8 @@ lb4_extract_tuple(struct __ctx_buff *ctx, struct iphdr *ip4, int l3_off, int *l4
 #ifdef ENABLE_SCTP
 	case IPPROTO_SCTP:
 #endif  /* ENABLE_SCTP */
-#ifdef ENABLE_IPV4_FRAGMENTS
-		ret = ipv4_handle_fragmentation(ctx, ip4, *l4_off,
-						CT_EGRESS,
-						(struct ipv4_frag_l4ports *)&tuple->dport,
-						NULL);
-#else
-		ret = l4_load_ports(ctx, *l4_off, &tuple->dport);
-#endif
+		ret = ipv4_load_l4_ports(ctx, ip4, *l4_off, CT_EGRESS,
+					 &tuple->dport, NULL);
 
 		if (IS_ERR(ret))
 			return ret;
@@ -1554,7 +1547,7 @@ static __always_inline int lb4_local(const void *map, struct __ctx_buff *ctx,
 		return DROP_NO_SERVICE;
 
 	ret = ct_lazy_lookup4(map, tuple, ctx, l4_off, has_l4_header,
-			      CT_SERVICE, SCOPE_REVERSE, state, &monitor);
+			      CT_SERVICE, SCOPE_REVERSE, CT_ENTRY_ANY, state, &monitor);
 	switch (ret) {
 	case CT_NEW:
 #ifdef ENABLE_SESSION_AFFINITY
@@ -1676,7 +1669,6 @@ static __always_inline int lb4_local(const void *map, struct __ctx_buff *ctx,
 	if (saddr == backend->address) {
 		new_saddr = IPV4_LOOPBACK;
 		state->loopback = 1;
-		state->svc_addr = saddr;
 	}
 
 	if (!state->loopback)
@@ -1728,16 +1720,12 @@ static __always_inline void lb4_ctx_store_state(struct __ctx_buff *ctx,
  */
 static __always_inline void
 lb4_ctx_restore_state(struct __ctx_buff *ctx, struct ct_state *state,
-		       __u32 daddr __maybe_unused, __u16 *proxy_port,
-		       __u32 *cluster_id __maybe_unused)
+		       __u16 *proxy_port, __u32 *cluster_id __maybe_unused)
 {
 	__u32 meta = ctx_load_meta(ctx, CB_CT_STATE);
 #ifndef DISABLE_LOOPBACK_LB
-	if (meta & 1) {
+	if (meta & 1)
 		state->loopback = 1;
-		state->addr = IPV4_LOOPBACK;
-		state->svc_addr = daddr; /* backend address after xlate */
-	}
 #endif
 	state->rev_nat_index = meta >> 16;
 

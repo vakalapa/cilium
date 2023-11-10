@@ -19,12 +19,8 @@ const (
 	// RouteTableVtep is the default table ID to use for VTEP routing rules
 	RouteTableVtep = 202
 
-	// RouteTableEgressGatewayInterfacesOffset is the offset for the per-ENI
-	// egress gateway routing tables.
-	// Each ENI interface will have its own table starting with this offset. It
-	// is 300 because it is highly unlikely to collide with the main routing
-	// table which is between 253-255. See ip-route(8).
-	RouteTableEgressGatewayInterfacesOffset = 300
+	// RouteTableProxy is the default table ID to use for proxy routing rules.
+	RouteTableProxy = 2004
 
 	// RouteTableInterfacesOffset is the offset for the per-ENI routing tables.
 	// Each ENI interface will have its own table starting with this offset. It
@@ -42,6 +38,10 @@ const (
 
 	// RouteMarkMask is the mask required for the route mark value
 	RouteMarkMask = 0xF00
+
+	// OutputMarkMask is the mask to use in output-mark of XFRM states. It is
+	// used to clear the node ID and the SPI from the packet mark.
+	OutputMarkMask = 0xFFFFFF00
 
 	// RouteMarkToProxy is the default route mark to use to indicate
 	// datapath needs to send the packet to the proxy.
@@ -69,12 +69,6 @@ const (
 
 	// RulePriorityWireguard is the priority of the rule used for routing packets to WireGuard device for encryption
 	RulePriorityWireguard = 1
-
-	// RulePriorityEgressGateway is the priority used in IP routes added by the manager.
-	// This value was picked as it's lower than the ones used by Cilium
-	// (RulePriorityEgressv2 = 111) or the AWS CNI (10) to install the IP
-	// rules for routing EP traffic to the correct ENI interface
-	RulePriorityEgressGateway = 8
 
 	// RulePriorityProxyIngress is the priority of the routing rule installed by
 	// the proxy package for redirecting inbound packets to the proxy. Priority 10
@@ -131,4 +125,8 @@ const (
 
 	// IPsecFwdPriority is the priority of the fwd rules placed by IPsec
 	IPsecFwdPriority = 0x0B9F
+
+	// IPsecXFRMMarkSPIShift defines how many bits the SPI is shifted when
+	// encoded in a XfrmMark
+	IPsecXFRMMarkSPIShift = 12
 )

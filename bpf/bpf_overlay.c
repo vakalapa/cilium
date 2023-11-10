@@ -48,10 +48,8 @@ static __always_inline int handle_ipv6(struct __ctx_buff *ctx,
 	struct remote_endpoint_info *info;
 	void *data_end, *data;
 	struct ipv6hdr *ip6;
-	struct bpf_tunnel_key key = {};
 	struct endpoint_info *ep;
 	bool decrypted;
-	__u32 key_size;
 
 	/* verifier workaround (dereference of modified ctx ptr) */
 	if (!revalidate_data_pull(ctx, &data, &data_end, &ip6))
@@ -59,7 +57,13 @@ static __always_inline int handle_ipv6(struct __ctx_buff *ctx,
 #ifdef ENABLE_NODEPORT
 	if (!ctx_skip_nodeport(ctx)) {
 		ret = nodeport_lb6(ctx, ip6, *identity, ext_err);
-		if (ret < 0)
+		/* nodeport_lb6() returns with TC_ACT_REDIRECT for
+		 * traffic to L7 LB. Policy enforcement needs to take
+		 * place after L7 LB has processed the packet, so we
+		 * return to stack immediately here with
+		 * TC_ACT_REDIRECT.
+		 */
+		if (ret < 0 || ret == TC_ACT_REDIRECT)
 			return ret;
 	}
 #endif
@@ -70,28 +74,16 @@ static __always_inline int handle_ipv6(struct __ctx_buff *ctx,
 	/* Lookup the source in the ipcache. After decryption this will be the
 	 * inner source IP to get the source security identity.
 	 */
-	info = ipcache_lookup6(&IPCACHE_MAP, (union v6addr *)&ip6->saddr,
-			       V6_CACHE_KEY_LEN, 0);
+	info = lookup_ip6_remote_endpoint((union v6addr *)&ip6->saddr, 0);
 
 	decrypted = ((ctx->mark & MARK_MAGIC_HOST_MASK) == MARK_MAGIC_DECRYPT);
 	if (decrypted) {
-		if (info) {
+		if (info)
 			*identity = info->sec_identity;
-			key.tunnel_id = get_tunnel_id(info->sec_identity);
-		}
+
+		cilium_dbg(ctx, info ? DBG_IP_ID_MAP_SUCCEED6 : DBG_IP_ID_MAP_FAILED6,
+			   ((__u32 *)&ip6->saddr)[3], *identity);
 	} else {
-		key_size = TUNNEL_KEY_WITHOUT_SRC_IP;
-		if (unlikely(ctx_get_tunnel_key(ctx, &key, key_size, 0) < 0))
-			return DROP_NO_TUNNEL_KEY;
-		*identity = get_id_from_tunnel_id(key.tunnel_id, ctx_get_protocol(ctx));
-
-		/* Any node encapsulating will map any HOST_ID source to be
-		 * presented as REMOTE_NODE_ID, therefore any attempt to signal
-		 * HOST_ID as source from a remote node can be dropped.
-		 */
-		if (*identity == HOST_ID)
-			return DROP_INVALID_IDENTITY;
-
 		/* Maybe overwrite the REMOTE_NODE_ID with
 		 * KUBE_APISERVER_NODE_ID to support upgrade. After v1.12,
 		 * this should be removed.
@@ -99,8 +91,6 @@ static __always_inline int handle_ipv6(struct __ctx_buff *ctx,
 		if (info && identity_is_remote_node(*identity))
 			*identity = info->sec_identity;
 	}
-
-	cilium_dbg(ctx, DBG_DECAP, key.tunnel_id, key.tunnel_label);
 
 #ifdef ENABLE_IPSEC
 	if (!decrypted) {
@@ -137,7 +127,7 @@ not_esp:
 	ep = lookup_ip6_endpoint(ip6);
 	if (ep && !(ep->flags & ENDPOINT_F_HOST))
 		return ipv6_local_delivery(ctx, l3_off, *identity, ep,
-					   METRIC_INGRESS, false);
+					   METRIC_INGRESS, false, true);
 
 	/* A packet entering the node from the tunnel and not going to a local
 	 * endpoint has to be going to the local host.
@@ -163,9 +153,13 @@ not_esp:
 __section_tail(CILIUM_MAP_CALLS, CILIUM_CALL_IPV6_FROM_OVERLAY)
 int tail_handle_ipv6(struct __ctx_buff *ctx)
 {
-	__u32 src_sec_identity = 0;
+	__u32 src_sec_identity = ctx_load_meta(ctx, CB_SRC_LABEL);
 	__s8 ext_err = 0;
-	int ret = handle_ipv6(ctx, &src_sec_identity, &ext_err);
+	int ret;
+
+	ctx_store_meta(ctx, CB_SRC_LABEL, 0);
+
+	ret = handle_ipv6(ctx, &src_sec_identity, &ext_err);
 
 	if (IS_ERR(ret))
 		return send_drop_notify_error_ext(ctx, src_sec_identity, ret, ext_err,
@@ -198,7 +192,7 @@ static __always_inline int ipv4_host_delivery(struct __ctx_buff *ctx, struct iph
 
 #if defined(ENABLE_CLUSTER_AWARE_ADDRESSING) && defined(ENABLE_INTER_CLUSTER_SNAT)
 static __always_inline int handle_inter_cluster_revsnat(struct __ctx_buff *ctx,
-							__u32 *src_sec_identity,
+							__u32 src_sec_identity,
 							__s8 *ext_err)
 {
 	int ret;
@@ -206,19 +200,14 @@ static __always_inline int handle_inter_cluster_revsnat(struct __ctx_buff *ctx,
 	__u32 cluster_id = 0;
 	void *data_end, *data;
 	struct endpoint_info *ep;
-	__u32 identity = ctx_load_meta(ctx, CB_SRC_LABEL);
 	__u32 cluster_id_from_identity =
-		extract_cluster_id_from_identity(identity);
+		extract_cluster_id_from_identity(src_sec_identity);
 	const struct ipv4_nat_target target = {
 	       .min_port = NODEPORT_PORT_MIN_NAT,
 	       .max_port = NODEPORT_PORT_MAX_NAT,
 	       .cluster_id = cluster_id_from_identity,
 	};
 	struct trace_ctx trace;
-
-	ctx_store_meta(ctx, CB_SRC_LABEL, 0);
-
-	*src_sec_identity = identity;
 
 	ret = snat_v4_rev_nat(ctx, &target, &trace, ext_err);
 	if (ret != NAT_PUNT_TO_STACK && ret != DROP_NAT_NO_MAPPING) {
@@ -248,7 +237,7 @@ static __always_inline int handle_inter_cluster_revsnat(struct __ctx_buff *ctx,
 		if (ep->flags & ENDPOINT_F_HOST)
 			return ipv4_host_delivery(ctx, ip4);
 
-		return ipv4_local_delivery(ctx, ETH_HLEN, identity, ip4, ep,
+		return ipv4_local_delivery(ctx, ETH_HLEN, src_sec_identity, ip4, ep,
 					   METRIC_INGRESS, false, false, true,
 					   cluster_id);
 	}
@@ -260,10 +249,12 @@ __section_tail(CILIUM_MAP_CALLS, CILIUM_CALL_IPV4_INTER_CLUSTER_REVSNAT)
 int tail_handle_inter_cluster_revsnat(struct __ctx_buff *ctx)
 {
 	int ret;
-	__u32 src_sec_identity;
+	__u32 src_sec_identity = ctx_load_meta(ctx, CB_SRC_LABEL);
 	__s8 ext_err = 0;
 
-	ret = handle_inter_cluster_revsnat(ctx, &src_sec_identity, &ext_err);
+	ctx_store_meta(ctx, CB_SRC_LABEL, 0);
+
+	ret = handle_inter_cluster_revsnat(ctx, src_sec_identity, &ext_err);
 	if (IS_ERR(ret))
 		return send_drop_notify_error_ext(ctx, src_sec_identity, ret, ext_err,
 						  CTX_ACT_DROP, METRIC_INGRESS);
@@ -276,11 +267,9 @@ static __always_inline int handle_ipv4(struct __ctx_buff *ctx,
 				       __s8 *ext_err __maybe_unused)
 {
 	struct remote_endpoint_info *info;
-	__u32 key_size __maybe_unused;
 	void *data_end, *data;
 	struct iphdr *ip4;
 	struct endpoint_info *ep;
-	struct bpf_tunnel_key key = {};
 	bool decrypted;
 
 	/* verifier workaround (dereference of modified ctx ptr) */
@@ -299,8 +288,13 @@ static __always_inline int handle_ipv4(struct __ctx_buff *ctx,
 #ifdef ENABLE_NODEPORT
 	if (!ctx_skip_nodeport(ctx)) {
 		int ret = nodeport_lb4(ctx, ip4, ETH_HLEN, *identity, ext_err);
-
-		if (ret < 0)
+		/* nodeport_lb4() returns with TC_ACT_REDIRECT for
+		 * traffic to L7 LB. Policy enforcement needs to take
+		 * place after L7 LB has processed the packet, so we
+		 * return to stack immediately here with
+		 * TC_ACT_REDIRECT.
+		 */
+		if (ret < 0 || ret == TC_ACT_REDIRECT)
 			return ret;
 	}
 #endif
@@ -310,27 +304,17 @@ static __always_inline int handle_ipv4(struct __ctx_buff *ctx,
 	/* Lookup the source in the ipcache. After decryption this will be the
 	 * inner source IP to get the source security identity.
 	 */
-	info = ipcache_lookup4(&IPCACHE_MAP, ip4->saddr, V4_CACHE_KEY_LEN, 0);
+	info = lookup_ip4_remote_endpoint(ip4->saddr, 0);
 
 	decrypted = ((ctx->mark & MARK_MAGIC_HOST_MASK) == MARK_MAGIC_DECRYPT);
 	/* If packets are decrypted the key has already been pushed into metadata. */
 	if (decrypted) {
-		if (info) {
+		if (info)
 			*identity = info->sec_identity;
-			key.tunnel_id = get_tunnel_id(info->sec_identity);
-		}
-	} else {
-#ifdef ENABLE_HIGH_SCALE_IPCACHE
-		key.tunnel_id = get_tunnel_id(*identity);
-#else
-		key_size = TUNNEL_KEY_WITHOUT_SRC_IP;
-		if (unlikely(ctx_get_tunnel_key(ctx, &key, key_size, 0) < 0))
-			return DROP_NO_TUNNEL_KEY;
-		*identity = get_id_from_tunnel_id(key.tunnel_id, ctx_get_protocol(ctx));
-#endif /* ENABLE_HIGH_SCALE_IPCACHE */
 
-		if (*identity == HOST_ID)
-			return DROP_INVALID_IDENTITY;
+		cilium_dbg(ctx, info ? DBG_IP_ID_MAP_SUCCEED4 : DBG_IP_ID_MAP_FAILED4,
+			   ip4->saddr, *identity);
+	} else {
 #ifdef ENABLE_VTEP
 		{
 			struct vtep_key vkey = {};
@@ -372,8 +356,6 @@ skip_vtep:
 		if (info && identity_is_remote_node(*identity))
 			*identity = info->sec_identity;
 	}
-
-	cilium_dbg(ctx, DBG_DECAP, key.tunnel_id, key.tunnel_label);
 
 #ifdef ENABLE_IPSEC
 	if (!decrypted) {
@@ -421,14 +403,11 @@ not_esp:
 __section_tail(CILIUM_MAP_CALLS, CILIUM_CALL_IPV4_FROM_OVERLAY)
 int tail_handle_ipv4(struct __ctx_buff *ctx)
 {
-	__u32 src_sec_identity = 0;
+	__u32 src_sec_identity = ctx_load_meta(ctx, CB_SRC_LABEL);
 	__s8 ext_err = 0;
 	int ret;
 
-#ifdef ENABLE_HIGH_SCALE_IPCACHE
-	src_sec_identity = ctx_load_meta(ctx, CB_SRC_LABEL);
 	ctx_store_meta(ctx, CB_SRC_LABEL, 0);
-#endif
 
 	ret = handle_ipv4(ctx, &src_sec_identity, &ext_err);
 	if (IS_ERR(ret))
@@ -534,6 +513,8 @@ static __always_inline bool is_esp(struct __ctx_buff *ctx, __u16 proto)
 __section_entry
 int cil_from_overlay(struct __ctx_buff *ctx)
 {
+	__u32 src_sec_identity = 0;
+	bool decrypted;
 	__u16 proto;
 	int ret;
 
@@ -550,12 +531,11 @@ int cil_from_overlay(struct __ctx_buff *ctx)
  * 1. ESP packets coming from overlay (encrypted and not marked)
  * 2. Non-ESP packets coming from overlay (plain and not marked)
  * 3. Non-ESP packets coming from stack re-inserted by xfrm (plain
- *    and marked with MARK_MAGIC_DECRYPT and has an identity as
- *    well, IPSec mode only)
+ *    and marked with MARK_MAGIC_DECRYPT. Only in IPSec mode.)
  *
  * 1. will be traced with TRACE_REASON_ENCRYPTED
  * 2. will be traced without TRACE_REASON_ENCRYPTED
- * 3. will be traced without TRACE_REASON_ENCRYPTED, and with identity
+ * 3. will be traced without TRACE_REASON_ENCRYPTED
  *
  * Note that 1. contains the ESP packets someone else generated.
  * In that case, we trace it as "encrypted", but it doesn't mean
@@ -565,9 +545,55 @@ int cil_from_overlay(struct __ctx_buff *ctx)
  * if the packets are ESP, because it doesn't matter for the
  * non-IPSec mode.
  */
+	decrypted = ((ctx->mark & MARK_MAGIC_HOST_MASK) == MARK_MAGIC_DECRYPT);
+
+	switch (proto) {
+#if defined(ENABLE_IPV4) || defined(ENABLE_IPV6)
+ #ifdef ENABLE_IPV6
+	case bpf_htons(ETH_P_IPV6):
+ #endif
+ #ifdef ENABLE_IPV4
+	case bpf_htons(ETH_P_IP):
+ #endif
+		/* If packets are decrypted the key has already been pushed into metadata. */
+		if (!decrypted) {
+			struct bpf_tunnel_key key = {};
+
+ #ifdef ENABLE_HIGH_SCALE_IPCACHE
+			/* already set by decapsulate_overlay(): */
+			key.tunnel_id = ctx_load_meta(ctx, CB_SRC_LABEL);
+ #else
+			__u32 key_size = TUNNEL_KEY_WITHOUT_SRC_IP;
+
+			if (unlikely(ctx_get_tunnel_key(ctx, &key, key_size, 0) < 0)) {
+				ret = DROP_NO_TUNNEL_KEY;
+				goto out;
+			}
+ #endif /* ENABLE_HIGH_SCALE_IPCACHE */
+			cilium_dbg(ctx, DBG_DECAP, key.tunnel_id, key.tunnel_label);
+
+			src_sec_identity = get_id_from_tunnel_id(key.tunnel_id, proto);
+
+			/* Any node encapsulating will map any HOST_ID source to be
+			 * presented as REMOTE_NODE_ID, therefore any attempt to signal
+			 * HOST_ID as source from a remote node can be dropped.
+			 */
+			if (src_sec_identity == HOST_ID) {
+				ret = DROP_INVALID_IDENTITY;
+				goto out;
+			}
+
+			ctx_store_meta(ctx, CB_SRC_LABEL, src_sec_identity);
+		}
+		break;
+#endif /* ENABLE_IPV4 || ENABLE_IPV6 */
+	default:
+		break;
+	}
+
 #ifdef ENABLE_IPSEC
 	if (is_esp(ctx, proto))
-		send_trace_notify(ctx, TRACE_FROM_OVERLAY, 0, 0, 0,
+		send_trace_notify(ctx, TRACE_FROM_OVERLAY, src_sec_identity, 0, 0,
 				  ctx->ingress_ifindex, TRACE_REASON_ENCRYPTED, 0);
 	else
 #endif
@@ -577,10 +603,10 @@ int cil_from_overlay(struct __ctx_buff *ctx)
 		/* Non-ESP packet marked with MARK_MAGIC_DECRYPT is a packet
 		 * re-inserted from the stack.
 		 */
-		if ((ctx->mark & MARK_MAGIC_HOST_MASK) == MARK_MAGIC_DECRYPT)
+		if (decrypted)
 			obs_point = TRACE_FROM_STACK;
 
-		send_trace_notify(ctx, obs_point, 0, 0, 0,
+		send_trace_notify(ctx, obs_point, src_sec_identity, 0, 0,
 				  ctx->ingress_ifindex,
 				  TRACE_REASON_UNKNOWN, TRACE_PAYLOAD_LEN);
 	}
@@ -641,7 +667,8 @@ int cil_from_overlay(struct __ctx_buff *ctx)
 	}
 out:
 	if (IS_ERR(ret))
-		return send_drop_notify_error(ctx, 0, ret, CTX_ACT_DROP, METRIC_INGRESS);
+		return send_drop_notify_error(ctx, src_sec_identity, ret,
+					      CTX_ACT_DROP, METRIC_INGRESS);
 	return ret;
 }
 
@@ -655,17 +682,6 @@ int cil_to_overlay(struct __ctx_buff *ctx)
 	int ret = TC_ACT_OK;
 	__u32 cluster_id __maybe_unused = 0;
 	__s8 ext_err = 0;
-
-	/* When WireGuard strict mode is enabled, we have additional information
-	 * regarding to which CIDRs packets must encrypted. We have to check the
-	 * packets against the CIDRs before encapsulation. If the packet is not
-	 * encrypted, we drop it.
-	 */
-	#if defined(TUNNEL_MODE) && defined(ENCRYPTION_STRICT_MODE)
-	if (!strict_allow(ctx))
-		return send_drop_notify_error(ctx, 0, DROP_UNENCRYPTED_TRAFFIC,
-					      CTX_ACT_DROP, METRIC_EGRESS);
-	#endif
 
 #ifdef ENABLE_BANDWIDTH_MANAGER
 	/* In tunneling mode, we should do this as close as possible to the

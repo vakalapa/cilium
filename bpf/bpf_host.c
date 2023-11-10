@@ -62,8 +62,7 @@ static __always_inline bool allow_vlan(__u32 __maybe_unused ifindex, __u32 __may
 }
 
 #if defined(ENABLE_IPV4) || defined(ENABLE_IPV6)
-static __always_inline int rewrite_dmac_to_host(struct __ctx_buff *ctx,
-						__u32 src_sec_identity)
+static __always_inline int rewrite_dmac_to_host(struct __ctx_buff *ctx)
 {
 	/* When attached to cilium_host, we rewrite the DMAC to the mac of
 	 * cilium_host (peer) to ensure the packet is being considered to be
@@ -73,8 +72,7 @@ static __always_inline int rewrite_dmac_to_host(struct __ctx_buff *ctx,
 
 	/* Rewrite to destination MAC of cilium_net (remote peer) */
 	if (eth_store_daddr(ctx, (__u8 *) &cilium_net_mac.addr, 0) < 0)
-		return send_drop_notify_error(ctx, src_sec_identity, DROP_WRITE_ERROR,
-					      CTX_ACT_OK, METRIC_INGRESS);
+		return DROP_WRITE_ERROR;
 
 	return CTX_ACT_OK;
 }
@@ -143,22 +141,22 @@ handle_ipv6(struct __ctx_buff *ctx, __u32 secctx __maybe_unused,
 #ifdef ENABLE_HOST_FIREWALL
 	struct ct_buffer6 ct_buffer = {};
 	bool need_hostfw = false;
+	__u8 nexthdr;
+	int hdrlen;
 #endif /* ENABLE_HOST_FIREWALL */
 	void *data, *data_end;
 	struct ipv6hdr *ip6;
 	int __maybe_unused ret;
-	int hdrlen;
-	__u8 nexthdr;
 
 	if (!revalidate_data(ctx, &data, &data_end, &ip6))
 		return DROP_INVALID;
 
+#ifdef ENABLE_HOST_FIREWALL
 	nexthdr = ip6->nexthdr;
 	hdrlen = ipv6_hdrlen(ctx, &nexthdr);
 	if (hdrlen < 0)
 		return hdrlen;
 
-#ifdef ENABLE_HOST_FIREWALL
 	if (likely(nexthdr == IPPROTO_ICMPV6)) {
 		ret = icmp6_host_handle(ctx, ETH_HLEN + hdrlen);
 		if (ret == SKIP_HOST_FIREWALL)
@@ -293,8 +291,7 @@ handle_ipv6_cont(struct __ctx_buff *ctx, __u32 secctx, const bool from_host,
 		/* If we are attached to cilium_host at egress, this will
 		 * rewrite the destination MAC address to the MAC of cilium_net.
 		 */
-		ret = rewrite_dmac_to_host(ctx, secctx);
-		/* DIRECT PACKET READ INVALID */
+		ret = rewrite_dmac_to_host(ctx);
 		if (IS_ERR(ret))
 			return ret;
 
@@ -324,7 +321,7 @@ handle_ipv6_cont(struct __ctx_buff *ctx, __u32 secctx, const bool from_host,
 		}
 #endif
 		return ipv6_local_delivery(ctx, l3_off, secctx, ep,
-					   METRIC_INGRESS, from_host);
+					   METRIC_INGRESS, from_host, false);
 	}
 
 	/* Below remainder is only relevant when traffic is pushed via cilium_host.
@@ -334,7 +331,7 @@ handle_ipv6_cont(struct __ctx_buff *ctx, __u32 secctx, const bool from_host,
 		return CTX_ACT_OK;
 
 	dst = (union v6addr *) &ip6->daddr;
-	info = ipcache_lookup6(&IPCACHE_MAP, dst, V6_CACHE_KEY_LEN, 0);
+	info = lookup_ip6_remote_endpoint(dst, 0);
 
 #ifdef TUNNEL_MODE
 	if (info != NULL && info->tunnel_endpoint != 0) {
@@ -672,8 +669,7 @@ handle_ipv4_cont(struct __ctx_buff *ctx, __u32 secctx, const bool from_host,
 		/* If we are attached to cilium_host at egress, this will
 		 * rewrite the destination MAC address to the MAC of cilium_net.
 		 */
-		ret = rewrite_dmac_to_host(ctx, secctx);
-		/* DIRECT PACKET READ INVALID */
+		ret = rewrite_dmac_to_host(ctx);
 		if (IS_ERR(ret))
 			return ret;
 
@@ -743,7 +739,7 @@ handle_ipv4_cont(struct __ctx_buff *ctx, __u32 secctx, const bool from_host,
 skip_vtep:
 #endif
 
-	info = ipcache_lookup4(&IPCACHE_MAP, ip4->daddr, V4_CACHE_KEY_LEN, 0);
+	info = lookup_ip4_remote_endpoint(ip4->daddr, 0);
 
 #ifdef TUNNEL_MODE
 	if (info != NULL && info->tunnel_endpoint != 0) {
@@ -882,78 +878,7 @@ handle_to_netdev_ipv4(struct __ctx_buff *ctx, struct trace_ctx *trace, __s8 *ext
 #endif /* ENABLE_HOST_FIREWALL */
 #endif /* ENABLE_IPV4 */
 
-#ifdef ENABLE_IPSEC
-#ifndef TUNNEL_MODE
-static __always_inline int
-do_netdev_encrypt_pools(struct __ctx_buff *ctx __maybe_unused)
-{
-	int ret = 0;
-	__u32 tunnel_endpoint = 0;
-	void *data, *data_end;
-	__u32 tunnel_source = IPV4_ENCRYPT_IFACE;
-	struct iphdr *ip4;
-	__be32 sum;
-
-	tunnel_endpoint = ctx_load_meta(ctx, CB_ENCRYPT_DST);
-	ctx->mark = 0;
-
-	if (!revalidate_data(ctx, &data, &data_end, &ip4))
-		return DROP_INVALID;
-
-	/* We only need to replace the IPsec outer IP addresses if they are set to
-	 * 0.0.0.0 -> 192.168.0.0. In that case, it means the packet was
-	 * encapsulated by the old XFRM OUT state and we need this BPF logic.
-	 * Otherwise, it means the packet was encapsulated by the new XFRM OUT
-	 * states, which already set the proper outer IP addresses; nothing needed
-	 * here.
-	 * This whole function can be removed in 1.15.
-	 */
-	if (ip4->saddr != 0)
-		return 0;
-
-	/* When IP_POOLS is enabled ip addresses are not
-	 * assigned on a per node basis so lacking node
-	 * affinity we can not use IP address to assign the
-	 * destination IP. Instead rewrite it here from cb[].
-	 */
-	sum = csum_diff(&ip4->daddr, sizeof(__u32), &tunnel_endpoint,
-			sizeof(tunnel_endpoint), 0);
-	if (ctx_store_bytes(ctx, ETH_HLEN + offsetof(struct iphdr, daddr),
-			    &tunnel_endpoint, sizeof(tunnel_endpoint), 0) < 0)
-		return DROP_WRITE_ERROR;
-	if (l3_csum_replace(ctx, ETH_HLEN + offsetof(struct iphdr, check),
-			    0, sum, 0) < 0)
-		return DROP_CSUM_L3;
-
-	if (!revalidate_data(ctx, &data, &data_end, &ip4))
-		return DROP_INVALID;
-
-	sum = csum_diff(&ip4->saddr, sizeof(__u32), &tunnel_source,
-			sizeof(tunnel_source), 0);
-	if (ctx_store_bytes(ctx, ETH_HLEN + offsetof(struct iphdr, saddr),
-			    &tunnel_source, sizeof(tunnel_source), 0) < 0)
-		return DROP_WRITE_ERROR;
-	if (l3_csum_replace(ctx, ETH_HLEN + offsetof(struct iphdr, check),
-			    0, sum, 0) < 0)
-		return DROP_CSUM_L3;
-
-	return ret;
-}
-
-static __always_inline int
-do_netdev_encrypt(struct __ctx_buff *ctx __maybe_unused,
-		  __u32 src_id __maybe_unused)
-{
-	int ret;
-
-	ret = do_netdev_encrypt_pools(ctx);
-	if (ret)
-		return send_drop_notify_error(ctx, src_id, ret, CTX_ACT_DROP, METRIC_INGRESS);
-
-	return CTX_ACT_OK;
-}
-
-#else /* TUNNEL_MODE */
+#if defined(ENABLE_IPSEC) && defined(TUNNEL_MODE)
 static __always_inline int do_netdev_encrypt_encap(struct __ctx_buff *ctx, __u32 src_id)
 {
 	struct trace_ctx trace = {
@@ -990,18 +915,10 @@ static __always_inline int do_netdev_encrypt_encap(struct __ctx_buff *ctx, __u32
 
 	ctx->mark = 0;
 	bpf_clear_meta(ctx);
-	return __encap_and_redirect_with_nodeid(ctx, 0, ep->tunnel_endpoint,
-						src_id, 0, NOT_VTEP_DST,
-						&trace);
+	return encap_and_redirect_with_nodeid(ctx, ep->tunnel_endpoint,
+					      src_id, 0, &trace);
 }
-
-static __always_inline int do_netdev_encrypt(struct __ctx_buff *ctx,
-					     __u32 src_id)
-{
-	return do_netdev_encrypt_encap(ctx, src_id);
-}
-#endif /* TUNNEL_MODE */
-#endif /* ENABLE_IPSEC */
+#endif /* ENABLE_IPSEC && TUNNEL_MODE */
 
 #ifdef ENABLE_L2_ANNOUNCEMENTS
 static __always_inline int handle_l2_announcement(struct __ctx_buff *ctx)
@@ -1088,13 +1005,16 @@ do_netdev(struct __ctx_buff *ctx, __u16 proto, const bool from_host)
 			send_trace_notify(ctx, TRACE_FROM_STACK, identity, 0, 0,
 					  ctx->ingress_ifindex, TRACE_REASON_ENCRYPTED,
 					  TRACE_PAYLOAD_LEN);
-			ret = do_netdev_encrypt(ctx, identity);
+			ret = CTX_ACT_OK;
+# ifdef TUNNEL_MODE
+			ret = do_netdev_encrypt_encap(ctx, identity);
 			if (IS_ERR(ret))
 				return send_drop_notify_error(ctx, identity, ret,
 							      CTX_ACT_DROP, METRIC_EGRESS);
+# endif /* TUNNEL_MODE */
 			return ret;
 		}
-#endif
+#endif /* ENABLE_IPSEC */
 
 		send_trace_notify(ctx, trace, identity, 0, 0,
 				  ctx->ingress_ifindex,
@@ -1222,96 +1142,6 @@ handle_netdev(struct __ctx_buff *ctx, const bool from_host)
 	return do_netdev(ctx, proto, from_host);
 }
 
-#ifdef ENABLE_SRV6
-static __always_inline int
-handle_srv6(struct __ctx_buff *ctx)
-{
-	__u32 *vrf_id, dst_sec_identity;
-	struct srv6_ipv6_2tuple *outer_ips;
-	struct iphdr *ip4 __maybe_unused;
-	struct remote_endpoint_info *ep;
-	void *data, *data_end;
-	struct ipv6hdr *ip6;
-	union v6addr *sid;
-	__u16 proto;
-
-	if (!validate_ethertype(ctx, &proto))
-		return DROP_UNSUPPORTED_L2;
-
-	switch (proto) {
-	case bpf_htons(ETH_P_IPV6):
-		if (!revalidate_data(ctx, &data, &data_end, &ip6))
-			return DROP_INVALID;
-
-		outer_ips = srv6_lookup_state_entry6(ip6);
-		if (outer_ips) {
-			ep_tail_call(ctx, CILIUM_CALL_SRV6_REPLY);
-			return DROP_MISSED_TAIL_CALL;
-		}
-
-		ep = lookup_ip6_remote_endpoint((union v6addr *)&ip6->daddr, 0);
-		if (ep) {
-			dst_sec_identity = ep->sec_identity;
-		} else {
-			dst_sec_identity = WORLD_IPV6_ID;
-		}
-
-		if (identity_is_cluster(dst_sec_identity))
-			return CTX_ACT_OK;
-
-		vrf_id = srv6_lookup_vrf6(&ip6->saddr, &ip6->daddr);
-		if (!vrf_id)
-			return CTX_ACT_OK;
-
-		sid = srv6_lookup_policy6(*vrf_id, &ip6->daddr);
-		if (!sid)
-			return CTX_ACT_OK;
-
-		srv6_store_meta_sid(ctx, sid);
-		ctx_store_meta(ctx, CB_SRV6_VRF_ID, *vrf_id);
-		ep_tail_call(ctx, CILIUM_CALL_SRV6_ENCAP);
-		return DROP_MISSED_TAIL_CALL;
-# ifdef ENABLE_IPV4
-	case bpf_htons(ETH_P_IP):
-		if (!revalidate_data(ctx, &data, &data_end, &ip4))
-			return DROP_INVALID;
-
-		outer_ips = srv6_lookup_state_entry4(ip4);
-		if (outer_ips) {
-			ep_tail_call(ctx, CILIUM_CALL_SRV6_REPLY);
-			return DROP_MISSED_TAIL_CALL;
-		}
-
-		ep = lookup_ip4_remote_endpoint(ip4->daddr, 0);
-		if (ep) {
-			dst_sec_identity = ep->sec_identity;
-		} else {
-			dst_sec_identity = WORLD_IPV6_ID;
-		}
-
-		if (identity_is_cluster(dst_sec_identity))
-			return CTX_ACT_OK;
-
-		vrf_id = srv6_lookup_vrf4(ip4->saddr, ip4->daddr);
-		if (!vrf_id)
-			return CTX_ACT_OK;
-
-		sid = srv6_lookup_policy4(*vrf_id, ip4->daddr);
-		if (!sid)
-			return CTX_ACT_OK;
-
-		srv6_store_meta_sid(ctx, sid);
-		ctx_store_meta(ctx, CB_SRV6_VRF_ID, *vrf_id);
-		ep_tail_call(ctx, CILIUM_CALL_SRV6_ENCAP);
-		return DROP_MISSED_TAIL_CALL;
-		break;
-# endif
-	}
-
-	return CTX_ACT_OK;
-}
-#endif /* ENABLE_SRV6 */
-
 /*
  * from-netdev is attached as a tc ingress filter to one or more physical devices
  * managed by Cilium (e.g., eth0). This program is only attached when:
@@ -1323,7 +1153,7 @@ handle_srv6(struct __ctx_buff *ctx)
 __section_entry
 int cil_from_netdev(struct __ctx_buff *ctx)
 {
-	__u32 __maybe_unused src_id = 0;
+	__u32 src_id = 0;
 
 #ifdef ENABLE_NODEPORT_ACCELERATION
 	__u32 flags = ctx_get_xfer(ctx, XFER_FLAGS);
@@ -1360,8 +1190,8 @@ int cil_from_netdev(struct __ctx_buff *ctx)
 #ifdef ENABLE_HIGH_SCALE_IPCACHE
 	ret = decapsulate_overlay(ctx, &src_id);
 	if (IS_ERR(ret))
-		return send_drop_notify_error(ctx, src_id, ret, CTX_ACT_DROP,
-				       METRIC_INGRESS);
+		goto drop_err;
+
 	if (ret == CTX_ACT_REDIRECT)
 		return ret;
 #endif /* ENABLE_HIGH_SCALE_IPCACHE */
@@ -1369,7 +1199,7 @@ int cil_from_netdev(struct __ctx_buff *ctx)
 	return handle_netdev(ctx, false);
 
 drop_err:
-	return send_drop_notify_error(ctx, 0, ret, CTX_ACT_DROP, METRIC_INGRESS);
+	return send_drop_notify_error(ctx, src_id, ret, CTX_ACT_DROP, METRIC_INGRESS);
 }
 
 /*
@@ -1436,6 +1266,9 @@ int cil_to_netdev(struct __ctx_buff *ctx __maybe_unused)
 #endif
 
 #ifdef ENABLE_HOST_FIREWALL
+	if (ctx_snat_done(ctx))
+		goto skip_host_firewall;
+
 	if (!validate_ethertype(ctx, &proto)) {
 		ret = DROP_UNSUPPORTED_L2;
 		goto out;
@@ -1468,6 +1301,8 @@ out:
 	if (IS_ERR(ret))
 		return send_drop_notify_error_ext(ctx, 0, ret, ext_err,
 						  CTX_ACT_DROP, METRIC_EGRESS);
+
+skip_host_firewall:
 #endif /* ENABLE_HOST_FIREWALL */
 
 #if defined(ENABLE_BANDWIDTH_MANAGER)
@@ -1498,25 +1333,12 @@ out:
 		return send_drop_notify_error(ctx, 0, ret, CTX_ACT_DROP,
 					      METRIC_EGRESS);
 
-	/* We disable the WireGuard strict mode if the tunnel mode is enabled,
-	 * since we have a check earlier in the datapath before encapsulation.
-	 * We chose this approach so that we don't have to decapsulate the
-	 * packet to check if the packet's original destination is allowed to
-	 * be sent unencrypted.
-	 */
-#if !defined(TUNNEL_MODE) && defined(ENCRYPTION_STRICT_MODE)
+#if defined(ENCRYPTION_STRICT_MODE)
 	if (!strict_allow(ctx))
 		return send_drop_notify_error(ctx, 0, DROP_UNENCRYPTED_TRAFFIC,
 					      CTX_ACT_DROP, METRIC_EGRESS);
-#endif /* !TUNNEL_MODE && ENCRYPTION_STRICT_MODE */
+#endif /* ENCRYPTION_STRICT_MODE */
 #endif /* ENABLE_WIREGUARD */
-
-#ifdef ENABLE_SRV6
-	ret = handle_srv6(ctx);
-	if (ret != CTX_ACT_OK)
-		return send_drop_notify_error(ctx, 0, ret, CTX_ACT_DROP,
-					      METRIC_EGRESS);
-#endif /* ENABLE_SRV6 */
 
 #ifdef ENABLE_HEALTH_CHECK
 	ret = lb_handle_health(ctx);
@@ -1536,7 +1358,9 @@ out:
 	}
 #endif
 
-__maybe_unused exit:
+#ifdef ENABLE_HEALTH_CHECK
+exit:
+#endif
 	if (IS_ERR(ret))
 		return send_drop_notify_error_ext(ctx, 0, ret, ext_err,
 						  CTX_ACT_DROP, METRIC_EGRESS);

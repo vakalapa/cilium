@@ -12,7 +12,7 @@ import (
 	"time"
 
 	. "github.com/cilium/checkmate"
-	miekgdns "github.com/miekg/dns"
+	ciliumdns "github.com/cilium/dns"
 
 	"github.com/cilium/cilium/pkg/allocator"
 	"github.com/cilium/cilium/pkg/checker"
@@ -129,7 +129,7 @@ func (ds *DaemonFQDNSuite) SetUpTest(c *C) {
 		Cache:           fqdn.NewDNSCache(0),
 		UpdateSelectors: d.updateSelectors,
 	})
-	d.endpointManager = endpointmanager.New(&dummyEpSyncher{})
+	d.endpointManager = endpointmanager.New(&dummyEpSyncher{}, nil)
 	d.policy.GetSelectorCache().SetLocalIdentityNotifier(d.dnsNameManager)
 	d.ipcache = ipcache.NewIPCache(&ipcache.Configuration{
 		Context:           context.TODO(),
@@ -144,7 +144,7 @@ func (ds *DaemonFQDNSuite) SetUpTest(c *C) {
 
 type dummyInfoRegistry struct{}
 
-func (*dummyInfoRegistry) FillEndpointInfo(info *accesslog.EndpointInfo, ip net.IP, id identity.NumericIdentity) {
+func (*dummyInfoRegistry) FillEndpointInfo(info *accesslog.EndpointInfo, addr netip.Addr, id identity.NumericIdentity) {
 }
 
 // makeIPs generates count sequential IPv4 IPs
@@ -212,7 +212,7 @@ func (ds *DaemonFQDNSuite) Benchmark_notifyOnDNSMsg(c *C) {
 			ID:   uint16(c.N % 65000),
 			IPv4: netip.MustParseAddr(fmt.Sprintf("10.96.%d.%d", (c.N>>16)%8, c.N%256)),
 			SecurityIdentity: &identity.Identity{
-				ID: identity.NumericIdentity(c.N % int(identity.MaximumAllocationIdentity)),
+				ID: identity.NumericIdentity(c.N % int(identity.GetMaximumAllocationIdentity())),
 			},
 			DNSZombies: &fqdn.DNSZombieMappings{
 				Mutex: lock.Mutex{},
@@ -234,28 +234,28 @@ func (ds *DaemonFQDNSuite) Benchmark_notifyOnDNSMsg(c *C) {
 			// parameter is only used in logging. Not using the endpoint's IP
 			// so we don't spend any time in the benchmark on converting from
 			// net.IP to string.
-			c.Assert(ds.d.notifyOnDNSMsg(time.Now(), ep, "10.96.64.8:12345", 0, "10.96.64.1:53", &miekgdns.Msg{
-				MsgHdr: miekgdns.MsgHdr{
+			c.Assert(ds.d.notifyOnDNSMsg(time.Now(), ep, "10.96.64.8:12345", 0, "10.96.64.1:53", &ciliumdns.Msg{
+				MsgHdr: ciliumdns.MsgHdr{
 					Response: true,
 				},
-				Question: []miekgdns.Question{{
+				Question: []ciliumdns.Question{{
 					Name: dns.FQDN("cilium.io"),
 				}},
-				Answer: []miekgdns.RR{&miekgdns.A{
-					Hdr: miekgdns.RR_Header{Name: dns.FQDN("cilium.io")},
+				Answer: []ciliumdns.RR{&ciliumdns.A{
+					Hdr: ciliumdns.RR_Header{Name: dns.FQDN("cilium.io")},
 					A:   ciliumDNSRecord[dns.FQDN("cilium.io")].IPs[0],
 				}}}, "udp", true, &dnsproxy.ProxyRequestContext{}), IsNil)
 
-			c.Assert(ds.d.notifyOnDNSMsg(time.Now(), ep, "10.96.64.4:54321", 0, "10.96.64.1:53", &miekgdns.Msg{
-				MsgHdr: miekgdns.MsgHdr{
+			c.Assert(ds.d.notifyOnDNSMsg(time.Now(), ep, "10.96.64.4:54321", 0, "10.96.64.1:53", &ciliumdns.Msg{
+				MsgHdr: ciliumdns.MsgHdr{
 					Response: true,
 				},
 				Compress: false,
-				Question: []miekgdns.Question{{
+				Question: []ciliumdns.Question{{
 					Name: dns.FQDN("ebpf.io"),
 				}},
-				Answer: []miekgdns.RR{&miekgdns.A{
-					Hdr: miekgdns.RR_Header{Name: dns.FQDN("ebpf.io")},
+				Answer: []ciliumdns.RR{&ciliumdns.A{
+					Hdr: ciliumdns.RR_Header{Name: dns.FQDN("ebpf.io")},
 					A:   ebpfDNSRecord[dns.FQDN("ebpf.io")].IPs[0],
 				}}}, "udp", true, &dnsproxy.ProxyRequestContext{}), IsNil)
 		}(endpoints[i%len(endpoints)])

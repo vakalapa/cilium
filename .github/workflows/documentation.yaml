@@ -17,13 +17,13 @@ concurrency:
 jobs:
   check_changes:
     name: Deduce required tests from code changes
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
     outputs:
       docs-tree: ${{ steps.docs-tree.outputs.src }}
     steps:
       - name: Checkout code
         if: ${{ !github.event.pull_request }}
-        uses: actions/checkout@c85c95e3d7251135ab7dc9ce3241c5835cc595a9 # v3.5.3
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
         with:
           persist-credentials: false
       - name: Check code changes
@@ -52,14 +52,14 @@ jobs:
     needs: check_changes
     if: ${{ needs.check_changes.outputs.docs-tree == 'true' }}
     name: Validate & Build HTML
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
     steps:
       - name: Checkout
-        uses: actions/checkout@c85c95e3d7251135ab7dc9ce3241c5835cc595a9 # v3.5.3
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
         with:
           persist-credentials: false
       - name: Build HTML
-        uses: docker://quay.io/cilium/docs-builder:4b194c0facc5d1d3b9c0dfef3529ee7c661a6b73@sha256:095cf9621cf46c6c878e25c3a98f02ef3d0aed1154936663e352fd3fe5e7613d
+        uses: docker://quay.io/cilium/docs-builder:d88a9684e1be32661e9e56d6b7e1e1350db7a1b1@sha256:f051371b2a910088a43dc5bd4289c9ca3a8754a8afb15f60f86f385660c1fd09
         with:
           entrypoint: ./Documentation/check-build.sh
           args: html

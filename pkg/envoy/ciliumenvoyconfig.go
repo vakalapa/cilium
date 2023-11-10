@@ -6,7 +6,6 @@ package envoy
 import (
 	"context"
 	"fmt"
-	"time"
 
 	cilium "github.com/cilium/proxy/go/cilium/api"
 	envoy_config_cluster "github.com/cilium/proxy/go/envoy/config/cluster/v3"
@@ -17,7 +16,6 @@ import (
 	envoy_config_http "github.com/cilium/proxy/go/envoy/extensions/filters/network/http_connection_manager/v3"
 	envoy_config_tcp "github.com/cilium/proxy/go/envoy/extensions/filters/network/tcp_proxy/v3"
 	envoy_config_tls "github.com/cilium/proxy/go/envoy/extensions/transport_sockets/tls/v3"
-	"golang.org/x/sys/unix"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
@@ -28,6 +26,7 @@ import (
 	lb "github.com/cilium/cilium/pkg/loadbalancer"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/policy/api"
+	"github.com/cilium/cilium/pkg/time"
 )
 
 const anyPort = "*"
@@ -91,8 +90,12 @@ func qualifyRouteConfigurationResourceNames(namespace, name string, routeConfig 
 		for _, rt := range vhost.Routes {
 			if action := rt.GetRoute(); action != nil {
 				if clusterName := action.GetCluster(); clusterName != "" {
-					action.GetClusterSpecifier().(*envoy_config_route.RouteAction_Cluster).Cluster =
-						api.ResourceQualifiedName(namespace, name, clusterName)
+					action.GetClusterSpecifier().(*envoy_config_route.RouteAction_Cluster).Cluster = api.ResourceQualifiedName(namespace, name, clusterName)
+				}
+				for _, r := range action.GetRequestMirrorPolicies() {
+					if clusterName := r.GetCluster(); clusterName != "" {
+						r.Cluster = api.ResourceQualifiedName(namespace, name, clusterName)
+					}
 				}
 				if weightedClusters := action.GetWeightedClusters(); weightedClusters != nil {
 					for _, cluster := range weightedClusters.GetClusters() {
@@ -153,21 +156,6 @@ func ParseResources(cecNamespace string, cecName string, anySlice []cilium_v2.XD
 				}
 				if !found {
 					listener.ListenerFilters = append(listener.ListenerFilters, getListenerFilter(false /* egress */, useOriginalSourceAddr, isL7LB))
-				}
-			}
-
-			// Inject listener socket option for Cilium datapath, if not already present.
-			{
-				found := false
-				for _, so := range listener.SocketOptions {
-					if so.Level == unix.SOL_SOCKET && so.Name == unix.SO_MARK {
-						found = true
-						break
-					}
-				}
-
-				if !found {
-					listener.SocketOptions = append(listener.SocketOptions, getListenerSocketMarkOption(false /* egress */))
 				}
 			}
 
@@ -237,9 +225,27 @@ func ParseResources(cecNamespace string, cecName string, anySlice []cilium_v2.XD
 						if err != nil {
 							continue
 						}
-						_, ok := any.(*envoy_config_tcp.TcpProxy)
+						tcpProxy, ok := any.(*envoy_config_tcp.TcpProxy)
 						if !ok {
 							continue
+						}
+
+						updated := false
+						switch c := tcpProxy.GetClusterSpecifier().(type) {
+						case *envoy_config_tcp.TcpProxy_Cluster:
+							c.Cluster = api.ResourceQualifiedName(cecNamespace, cecName, c.Cluster)
+							updated = true
+						case *envoy_config_tcp.TcpProxy_WeightedClusters:
+							for _, wc := range c.WeightedClusters.Clusters {
+								wc.Name = api.ResourceQualifiedName(cecNamespace, cecName, wc.Name)
+							}
+							updated = true
+						}
+
+						if updated {
+							filter.ConfigType = &envoy_config_listener.Filter_TypedConfig{
+								TypedConfig: toAny(tcpProxy),
+							}
 						}
 					default:
 						continue
@@ -419,9 +425,6 @@ func ParseResources(cecNamespace string, cecName string, anySlice []cilium_v2.XD
 				resources.portAllocations = make(map[string]uint16)
 			}
 			resources.portAllocations[listener.Name] = port
-
-			// Inject Transparent to work with TPROXY
-			listener.Transparent = &wrapperspb.BoolValue{Value: true}
 		}
 		if validate {
 			if err := listener.Validate(); err != nil {
@@ -801,13 +804,25 @@ func (s *xdsServer) DeleteEnvoyResources(ctx context.Context, resources Resource
 
 func (s *xdsServer) UpsertEnvoyEndpoints(serviceName lb.ServiceName, backendMap map[string][]*lb.Backend) error {
 	var resources Resources
-	lbEndpoints := []*envoy_config_endpoint.LbEndpoint{}
+
+	resources.Endpoints = getEndpointsForLBBackends(serviceName, backendMap)
+
+	// Using context.TODO() is fine as we do not upsert listener resources here - the
+	// context ends up being used only if listener(s) are included in 'resources'.
+	return s.UpsertEnvoyResources(context.TODO(), resources, nil)
+}
+
+func getEndpointsForLBBackends(serviceName lb.ServiceName, backendMap map[string][]*lb.Backend) []*envoy_config_endpoint.ClusterLoadAssignment {
+	var endpoints []*envoy_config_endpoint.ClusterLoadAssignment
+
 	for port, bes := range backendMap {
+		var lbEndpoints []*envoy_config_endpoint.LbEndpoint
 		for _, be := range bes {
 			if be.Protocol != lb.TCP {
 				// Only TCP services supported with Envoy for now
 				continue
 			}
+
 			lbEndpoints = append(lbEndpoints, &envoy_config_endpoint.LbEndpoint{
 				HostIdentifier: &envoy_config_endpoint.LbEndpoint_Endpoint{
 					Endpoint: &envoy_config_endpoint.Endpoint{
@@ -825,6 +840,7 @@ func (s *xdsServer) UpsertEnvoyEndpoints(serviceName lb.ServiceName, backendMap 
 				},
 			})
 		}
+
 		endpoint := &envoy_config_endpoint.ClusterLoadAssignment{
 			ClusterName: fmt.Sprintf("%s:%s", serviceName.String(), port),
 			Endpoints: []*envoy_config_endpoint.LocalityLbEndpoints{
@@ -833,12 +849,12 @@ func (s *xdsServer) UpsertEnvoyEndpoints(serviceName lb.ServiceName, backendMap 
 				},
 			},
 		}
-		resources.Endpoints = append(resources.Endpoints, endpoint)
+		endpoints = append(endpoints, endpoint)
 
 		// for backward compatibility, if any port is allowed, publish one more
 		// endpoint having cluster name as service name.
 		if port == anyPort {
-			resources.Endpoints = append(resources.Endpoints, &envoy_config_endpoint.ClusterLoadAssignment{
+			endpoints = append(endpoints, &envoy_config_endpoint.ClusterLoadAssignment{
 				ClusterName: serviceName.String(),
 				Endpoints: []*envoy_config_endpoint.LocalityLbEndpoints{
 					{
@@ -848,9 +864,8 @@ func (s *xdsServer) UpsertEnvoyEndpoints(serviceName lb.ServiceName, backendMap 
 			})
 		}
 	}
-	// Using context.TODO() is fine as we do not upsert listener resources here - the
-	// context ends up being used only if listener(s) are included in 'resources'.
-	return s.UpsertEnvoyResources(context.TODO(), resources, nil)
+
+	return endpoints
 }
 
 func fillInTlsContextXDS(cecNamespace string, cecName string, tls *envoy_config_tls.CommonTlsContext) bool {

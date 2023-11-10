@@ -9,7 +9,7 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"time"
+	"strings"
 
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
@@ -23,7 +23,10 @@ import (
 	"github.com/cilium/cilium/pkg/mac"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/sysctl"
+	"github.com/cilium/cilium/pkg/time"
 )
+
+const qdiscClsact = "clsact"
 
 func directionToParent(dir string) uint32 {
 	switch dir {
@@ -44,7 +47,7 @@ func replaceQdisc(link netlink.Link) error {
 
 	qdisc := &netlink.GenericQdisc{
 		QdiscAttrs: attrs,
-		QdiscType:  "clsact",
+		QdiscType:  qdiscClsact,
 	}
 
 	return netlink.QdiscReplace(qdisc)
@@ -68,7 +71,7 @@ type progDefinition struct {
 // For example, this is the case with from-netdev and to-netdev. If eth0:to-netdev
 // gets its program and maps replaced and unpinned, its eth0:from-netdev counterpart
 // will miss tail calls (and drop packets) until it has been replaced as well.
-func replaceDatapath(ctx context.Context, ifName, objPath string, progs []progDefinition, xdpMode string) (func(), error) {
+func replaceDatapath(ctx context.Context, ifName, objPath string, progs []progDefinition, xdpMode string) (_ func(), err error) {
 	// Avoid unnecessarily loading a prog.
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -95,11 +98,42 @@ func replaceDatapath(ctx context.Context, ifName, objPath string, progs []progDe
 		}
 	}
 
+	// Unconditionally repin cilium_calls_* maps to prevent them from being
+	// repopulated by the loader.
+	for key, ms := range spec.Maps {
+		if !strings.HasPrefix(ms.Name, "cilium_calls_") {
+			continue
+		}
+
+		if err := bpf.RepinMap(bpf.TCGlobalsPath(), key, ms); err != nil {
+			return nil, fmt.Errorf("repinning map %s: %w", key, err)
+		}
+
+		defer func() {
+			revert := false
+			// This captures named return variable err.
+			if err != nil {
+				revert = true
+			}
+
+			if err := bpf.FinalizeMap(bpf.TCGlobalsPath(), key, revert); err != nil {
+				l.WithError(err).Error("Could not finalize map")
+			}
+		}()
+
+		// Only one cilium_calls_* per collection, we can stop here.
+		break
+	}
+
 	// Load the CollectionSpec into the kernel, picking up any pinned maps from
 	// bpffs in the process.
 	finalize := func() {}
+	pinPath := bpf.TCGlobalsPath()
 	opts := ebpf.CollectionOptions{
-		Maps: ebpf.MapOptions{PinPath: bpf.TCGlobalsPath()},
+		Maps: ebpf.MapOptions{PinPath: pinPath},
+	}
+	if err := bpf.MkdirBPF(pinPath); err != nil {
+		return nil, fmt.Errorf("creating bpffs pin path: %w", err)
 	}
 	l.Debug("Loading Collection into kernel")
 	coll, err := bpf.LoadCollection(spec, opts)
@@ -140,8 +174,20 @@ func replaceDatapath(ctx context.Context, ifName, objPath string, progs []progDe
 
 	for _, prog := range progs {
 		scopedLog := l.WithField("progName", prog.progName).WithField("direction", prog.direction)
-		scopedLog.Debug("Attaching program to interface")
-		if err := attachProgram(link, coll.Programs[prog.progName], prog.progName, directionToParent(prog.direction), xdpModeToFlag(xdpMode)); err != nil {
+		if xdpMode != "" {
+			linkDir := bpffsDeviceLinksDir(bpf.CiliumPath(), link)
+			if err := bpf.MkdirBPF(linkDir); err != nil {
+				return nil, fmt.Errorf("creating bpffs link dir for device %s: %w", link.Attrs().Name, err)
+			}
+
+			scopedLog.Debug("Attaching XDP program to interface")
+			err = attachXDPProgram(link, coll.Programs[prog.progName], prog.progName, linkDir, xdpModeToFlag(xdpMode))
+		} else {
+			scopedLog.Debug("Attaching TC program to interface")
+			err = attachTCProgram(link, coll.Programs[prog.progName], prog.progName, directionToParent(prog.direction))
+		}
+
+		if err != nil {
 			// Program replacement unsuccessful, revert bpffs migration.
 			l.Debug("Reverting bpffs map migration")
 			if err := bpf.FinalizeBPFFSMigration(bpf.TCGlobalsPath(), spec, true); err != nil {
@@ -156,21 +202,10 @@ func replaceDatapath(ctx context.Context, ifName, objPath string, progs []progDe
 	return finalize, nil
 }
 
-// attachProgram attaches prog to link.
-// If xdpFlags is non-zero, attaches prog to XDP.
-func attachProgram(link netlink.Link, prog *ebpf.Program, progName string, qdiscParent uint32, xdpFlags uint32) error {
+// attachTCProgram attaches the TC program 'prog' to link.
+func attachTCProgram(link netlink.Link, prog *ebpf.Program, progName string, qdiscParent uint32) error {
 	if prog == nil {
 		return errors.New("cannot attach a nil program")
-	}
-
-	if xdpFlags != 0 {
-		// Omitting XDP_FLAGS_UPDATE_IF_NOEXIST equals running 'ip' with -force,
-		// and will clobber any existing XDP attachment to the interface.
-		if err := netlink.LinkSetXdpFdWithFlags(link, prog.FD(), int(xdpFlags)); err != nil {
-			return fmt.Errorf("attaching XDP program to interface %s: %w", link.Attrs().Name, err)
-		}
-
-		return nil
 	}
 
 	if err := replaceQdisc(link); err != nil {
@@ -197,9 +232,9 @@ func attachProgram(link netlink.Link, prog *ebpf.Program, progName string, qdisc
 	return nil
 }
 
-// RemoveTCFilters removes all tc filters from the given interface.
+// removeTCFilters removes all tc filters from the given interface.
 // Direction is passed as netlink.HANDLE_MIN_{INGRESS,EGRESS} via tcDir.
-func RemoveTCFilters(ifName string, tcDir uint32) error {
+func removeTCFilters(ifName string, tcDir uint32) error {
 	link, err := netlink.LinkByName(ifName)
 	if err != nil {
 		return err
@@ -427,7 +462,7 @@ func addHostDeviceAddr(hostDev netlink.Link, ipv4, ipv6 net.IP) error {
 		addr := netlink.Addr{
 			IPNet: &net.IPNet{
 				IP:   ipv6,
-				Mask: net.CIDRMask(64, 128), // corresponds to /64
+				Mask: net.CIDRMask(128, 128), // corresponds to /128
 			},
 		}
 
@@ -691,4 +726,62 @@ func renameDevice(from, to string) error {
 	}
 
 	return nil
+}
+
+// DeviceHasTCProgramLoaded checks whether a given device has tc filter/qdisc progs attached.
+func DeviceHasTCProgramLoaded(hostInterface string, checkEgress bool) (bool, error) {
+	const bpfProgPrefix = "cil_"
+
+	l, err := netlink.LinkByName(hostInterface)
+	if err != nil {
+		return false, fmt.Errorf("unable to find endpoint link by name: %w", err)
+	}
+
+	dd, err := netlink.QdiscList(l)
+	if err != nil {
+		return false, fmt.Errorf("unable to fetch qdisc list for endpoint: %w", err)
+	}
+	var found bool
+	for _, d := range dd {
+		if d.Type() == qdiscClsact {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return false, nil
+	}
+
+	ff, err := netlink.FilterList(l, netlink.HANDLE_MIN_INGRESS)
+	if err != nil {
+		return false, fmt.Errorf("unable to fetch ingress filter list: %w", err)
+	}
+	var filtersCount int
+	for _, f := range ff {
+		if filter, ok := f.(*netlink.BpfFilter); ok {
+			if strings.HasPrefix(filter.Name, bpfProgPrefix) {
+				filtersCount++
+			}
+		}
+	}
+	if filtersCount == 0 {
+		return false, nil
+	}
+	if !checkEgress {
+		return true, nil
+	}
+
+	ff, err = netlink.FilterList(l, netlink.HANDLE_MIN_EGRESS)
+	if err != nil {
+		return false, fmt.Errorf("unable to fetch egress filter list: %w", err)
+	}
+	filtersCount = 0
+	for _, f := range ff {
+		if filter, ok := f.(*netlink.BpfFilter); ok {
+			if strings.HasPrefix(filter.Name, bpfProgPrefix) {
+				filtersCount++
+			}
+		}
+	}
+	return len(ff) > 0 && filtersCount > 0, nil
 }

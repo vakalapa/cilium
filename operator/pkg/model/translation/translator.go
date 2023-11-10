@@ -36,6 +36,7 @@ type defaultTranslator struct {
 	namespace        string
 	secretsNamespace string
 	enforceHTTPs     bool
+	useProxyProtocol bool
 
 	// hostNameSuffixMatch is a flag to control whether the host name suffix match.
 	// Hostnames that are prefixed with a wildcard label (`*.`) are interpreted
@@ -47,12 +48,13 @@ type defaultTranslator struct {
 }
 
 // NewTranslator returns a new translator
-func NewTranslator(name, namespace, secretsNamespace string, enforceHTTPs bool, hostNameSuffixMatch bool, idleTimeoutSeconds int) Translator {
+func NewTranslator(name, namespace, secretsNamespace string, enforceHTTPs bool, useProxyProtocol bool, hostNameSuffixMatch bool, idleTimeoutSeconds int) Translator {
 	return &defaultTranslator{
 		name:                name,
 		namespace:           namespace,
 		secretsNamespace:    secretsNamespace,
 		enforceHTTPs:        enforceHTTPs,
+		useProxyProtocol:    useProxyProtocol,
 		hostNameSuffixMatch: hostNameSuffixMatch,
 		idleTimeoutSeconds:  idleTimeoutSeconds,
 	}
@@ -144,14 +146,18 @@ func (i *defaultTranslator) getHTTPRouteListener(m *model.Model) []ciliumv2.XDSR
 	if len(m.HTTP) == 0 {
 		return nil
 	}
-	var tlsMap = make(map[model.TLSSecret][]string)
+	tlsMap := make(map[model.TLSSecret][]string)
 	for _, h := range m.HTTP {
 		for _, s := range h.TLS {
 			tlsMap[s] = append(tlsMap[s], h.Hostname)
 		}
 	}
 
-	l, _ := NewHTTPListenerWithDefaults("listener", i.secretsNamespace, tlsMap)
+	mutatorFuncs := []ListenerMutator{}
+	if i.useProxyProtocol {
+		mutatorFuncs = append(mutatorFuncs, WithProxyProtocol())
+	}
+	l, _ := NewHTTPListenerWithDefaults("listener", i.secretsNamespace, tlsMap, mutatorFuncs...)
 	return []ciliumv2.XDSResource{l}
 }
 
@@ -161,11 +167,11 @@ func (i *defaultTranslator) getTLSRouteListener(m *model.Model) []ciliumv2.XDSRe
 	if len(m.TLS) == 0 {
 		return nil
 	}
-	var backendsMap = make(map[string][]string)
+	backendsMap := make(map[string][]string)
 	for _, h := range m.TLS {
 		for _, route := range h.Routes {
 			for _, backend := range route.Backends {
-				key := fmt.Sprintf("%s/%s:%s", backend.Namespace, backend.Name, backend.Port.GetPort())
+				key := fmt.Sprintf("%s:%s:%s", backend.Namespace, backend.Name, backend.Port.GetPort())
 				backendsMap[key] = append(backendsMap[key], route.Hostnames...)
 			}
 		}
@@ -175,7 +181,11 @@ func (i *defaultTranslator) getTLSRouteListener(m *model.Model) []ciliumv2.XDSRe
 		return nil
 	}
 
-	l, _ := NewSNIListenerWithDefaults("listener", backendsMap)
+	mutatorFuncs := []ListenerMutator{}
+	if i.useProxyProtocol {
+		mutatorFuncs = append(mutatorFuncs, WithProxyProtocol())
+	}
+	l, _ := NewSNIListenerWithDefaults("listener", backendsMap, mutatorFuncs...)
 	return []ciliumv2.XDSResource{l}
 }
 
@@ -255,7 +265,13 @@ func (i *defaultTranslator) getEnvoyHTTPRouteConfiguration(m *model.Model) []cil
 	return res
 }
 
-func getBackendName(ns, name, port string) string {
+func getClusterName(ns, name, port string) string {
+	// the name is having the format of "namespace:name:port"
+	// -> slash would prevent ParseResources from rewriting with CEC namespace and name!
+	return fmt.Sprintf("%s:%s:%s", ns, name, port)
+}
+
+func getClusterServiceName(ns, name, port string) string {
 	// the name is having the format of "namespace/name:port"
 	return fmt.Sprintf("%s/%s:%s", ns, name, port)
 }
@@ -267,22 +283,30 @@ func (i *defaultTranslator) getClusters(m *model.Model) []ciliumv2.XDSResource {
 	for ns, v := range getNamespaceNamePortsMapForHTTP(m) {
 		for name, ports := range v {
 			for _, port := range ports {
-				b := getBackendName(ns, name, port)
-				sortedClusterNames = append(sortedClusterNames, b)
-				envoyClusters[b], _ = NewHTTPCluster(b,
+				clusterName := getClusterName(ns, name, port)
+				clusterServiceName := getClusterServiceName(ns, name, port)
+				sortedClusterNames = append(sortedClusterNames, clusterName)
+				mutators := []ClusterMutator{
 					WithConnectionTimeout(5),
 					WithIdleTimeout(i.idleTimeoutSeconds),
 					WithClusterLbPolicy(int32(envoy_config_cluster_v3.Cluster_ROUND_ROBIN)),
-					WithOutlierDetection(true))
+					WithOutlierDetection(true),
+				}
+
+				if isGRPCService(m, ns, name, port) {
+					mutators = append(mutators, WithProtocol(HTTPVersion2))
+				}
+				envoyClusters[clusterName], _ = NewHTTPCluster(clusterName, clusterServiceName, mutators...)
 			}
 		}
 	}
 	for ns, v := range getNamespaceNamePortsMapForTLS(m) {
 		for name, ports := range v {
 			for _, port := range ports {
-				b := getBackendName(ns, name, port)
-				sortedClusterNames = append(sortedClusterNames, b)
-				envoyClusters[b], _ = NewTCPClusterWithDefaults(b)
+				clusterName := getClusterName(ns, name, port)
+				clusterServiceName := getClusterServiceName(ns, name, port)
+				sortedClusterNames = append(sortedClusterNames, clusterName)
+				envoyClusters[clusterName], _ = NewTCPClusterWithDefaults(clusterName, clusterServiceName)
 			}
 		}
 	}
@@ -293,6 +317,24 @@ func (i *defaultTranslator) getClusters(m *model.Model) []ciliumv2.XDSResource {
 		res[i] = envoyClusters[name]
 	}
 
+	return res
+}
+
+func isGRPCService(m *model.Model, ns string, name string, port string) bool {
+	var res bool
+
+	for _, l := range m.HTTP {
+		for _, r := range l.Routes {
+			if !r.IsGRPC {
+				continue
+			}
+			for _, be := range r.Backends {
+				if be.Name == name && be.Namespace == ns && be.Port != nil && be.Port.GetPort() == port {
+					return true
+				}
+			}
+		}
+	}
 	return res
 }
 
@@ -316,8 +358,11 @@ func getNamespaceNamePortsMap(m *model.Model) map[string]map[string][]string {
 			}
 			mergeBackendsInNamespaceNamePortMap(r.Backends, namespaceNamePortMap)
 
-			if r.RequestMirror != nil && r.RequestMirror.Backend != nil {
-				mergeBackendsInNamespaceNamePortMap([]model.Backend{*r.RequestMirror.Backend}, namespaceNamePortMap)
+			for _, rm := range r.RequestMirrors {
+				if rm.Backend == nil {
+					continue
+				}
+				mergeBackendsInNamespaceNamePortMap([]model.Backend{*rm.Backend}, namespaceNamePortMap)
 			}
 		}
 	}
@@ -338,8 +383,11 @@ func getNamespaceNamePortsMapForHTTP(m *model.Model) map[string]map[string][]str
 	for _, l := range m.HTTP {
 		for _, r := range l.Routes {
 			mergeBackendsInNamespaceNamePortMap(r.Backends, namespaceNamePortMap)
-			if r.RequestMirror != nil && r.RequestMirror.Backend != nil {
-				mergeBackendsInNamespaceNamePortMap([]model.Backend{*r.RequestMirror.Backend}, namespaceNamePortMap)
+			for _, rm := range r.RequestMirrors {
+				if rm.Backend == nil {
+					continue
+				}
+				mergeBackendsInNamespaceNamePortMap([]model.Backend{*rm.Backend}, namespaceNamePortMap)
 			}
 		}
 	}

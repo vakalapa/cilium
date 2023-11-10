@@ -87,6 +87,14 @@ func (t TestAllocatorKey) PutKeyFromMap(m map[string]string) allocator.Allocator
 	panic("empty map")
 }
 
+func (t TestAllocatorKey) PutValue(key any, value any) allocator.AllocatorKey {
+	panic("not implemented")
+}
+
+func (t TestAllocatorKey) Value(any) any {
+	panic("not implemented")
+}
+
 func randomTestName() string {
 	return rand.RandomStringWithPrefix(testPrefix, 12)
 }
@@ -637,7 +645,7 @@ func (s *AllocatorSuite) TestRemoteCache(c *C) {
 
 	wg.Add(1)
 	go func() {
-		rc.Watch(ctx)
+		rc.Watch(ctx, func(ctx context.Context) {})
 		wg.Done()
 	}()
 

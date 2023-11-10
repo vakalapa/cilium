@@ -13,7 +13,6 @@ import (
 	"sort"
 	"strings"
 	"text/template"
-	"time"
 
 	"github.com/containernetworking/cni/libcni"
 	"github.com/fsnotify/fsnotify"
@@ -24,6 +23,7 @@ import (
 
 	"github.com/cilium/cilium/pkg/controller"
 	"github.com/cilium/cilium/pkg/hive"
+	"github.com/cilium/cilium/pkg/time"
 	cnitypes "github.com/cilium/cilium/plugins/cilium-cni/types"
 )
 
@@ -272,6 +272,11 @@ func (c *cniConfigManager) setupCNIConfFile() error {
 		}
 	}
 
+	err = ensureDirExists(c.cniConfDir)
+	if err != nil {
+		return fmt.Errorf("failed to create the dir %s of the CNI configuration file: %w", c.cniConfDir, err)
+	}
+
 	dest := path.Join(c.cniConfDir, c.cniConfFile)
 
 	// Check to see if existing file is the same; if so, do nothing
@@ -307,7 +312,7 @@ func (c *cniConfigManager) renderCNIConf() (cniConfig []byte, err error) {
 		}
 	} else {
 		c.log.Infof("Generating CNI configuration file with mode %s", c.config.CNIChainingMode)
-		tmpl := cniConfigs[c.config.CNIChainingMode]
+		tmpl := cniConfigs[strings.ToLower(c.config.CNIChainingMode)]
 		cniConfig = []byte(c.renderCNITemplate(tmpl))
 	}
 
@@ -464,4 +469,12 @@ func (c *cniConfigManager) findCNINetwork(wantNetwork string) ([]byte, error) {
 		return json.Marshal(rawConfigList)
 	}
 	return nil, fmt.Errorf("no matching CNI configurations found (will retry)")
+}
+
+func ensureDirExists(dir string) error {
+	err := os.MkdirAll(dir, os.ModePerm)
+	if err != nil && os.IsExist(err) {
+		return nil
+	}
+	return err
 }

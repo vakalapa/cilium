@@ -19,6 +19,7 @@ import (
 	"github.com/cilium/cilium/pkg/identity/cache"
 	"github.com/cilium/cilium/pkg/ipcache"
 	"github.com/cilium/cilium/pkg/kvstore"
+	"github.com/cilium/cilium/pkg/kvstore/store"
 	"github.com/cilium/cilium/pkg/metrics"
 	"github.com/cilium/cilium/pkg/source"
 	"github.com/cilium/cilium/pkg/testutils"
@@ -38,12 +39,12 @@ type remoteEtcdClientWrapper struct {
 }
 
 // Override the ListAndWatch method so that we can track whether the synced canaries prefix has been watched.
-func (w *remoteEtcdClientWrapper) ListAndWatch(ctx context.Context, name, prefix string, chanSize int) *kvstore.Watcher {
+func (w *remoteEtcdClientWrapper) ListAndWatch(ctx context.Context, prefix string, chanSize int) *kvstore.Watcher {
 	if prefix == fmt.Sprintf("cilium/synced/%s/", w.name) {
 		w.syncedCanariesWatched = true
 	}
 
-	return w.BackendOperations.ListAndWatch(ctx, name, prefix, chanSize)
+	return w.BackendOperations.ListAndWatch(ctx, prefix, chanSize)
 }
 
 type fakeIPCache struct{ updates atomic.Int32 }
@@ -82,7 +83,8 @@ func TestRemoteClusterRun(t *testing.T) {
 			name: "remote cluster supports sync canaries",
 			srccfg: &types.CiliumClusterConfig{
 				Capabilities: types.CiliumClusterConfigCapabilities{
-					SyncedCanaries: true,
+					SyncedCanaries:       true,
+					MaxConnectedClusters: 255,
 				},
 			},
 			kvs: map[string]string{
@@ -101,8 +103,9 @@ func TestRemoteClusterRun(t *testing.T) {
 			name: "remote cluster supports both sync canaries and cached prefixes",
 			srccfg: &types.CiliumClusterConfig{
 				Capabilities: types.CiliumClusterConfigCapabilities{
-					SyncedCanaries: true,
-					Cached:         true,
+					SyncedCanaries:       true,
+					Cached:               true,
+					MaxConnectedClusters: 255,
 				},
 			},
 			kvs: map[string]string{
@@ -119,6 +122,7 @@ func TestRemoteClusterRun(t *testing.T) {
 		},
 	}
 
+	store := store.NewFactory(store.MetricsProvider())
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var wg sync.WaitGroup
@@ -150,6 +154,8 @@ func TestRemoteClusterRun(t *testing.T) {
 					RemoteIdentityWatcher: allocator,
 					ClusterIDsManager:     NewClusterMeshUsedIDs(),
 					Metrics:               NewMetrics(),
+					StoreFactory:          store,
+					ClusterInfo:           types.ClusterInfo{MaxConnectedClusters: 255},
 				},
 				globalServices: newGlobalServiceCache(metrics.NoOpGauge),
 			}

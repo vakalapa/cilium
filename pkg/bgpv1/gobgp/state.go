@@ -6,11 +6,11 @@ package gobgp
 import (
 	"context"
 	"fmt"
-	"time"
 
 	"github.com/cilium/cilium/api/v1/models"
 	"github.com/cilium/cilium/pkg/bgpv1/types"
 	v2alpha1api "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
+	"github.com/cilium/cilium/pkg/time"
 
 	gobgp "github.com/osrg/gobgp/v3/api"
 )
@@ -60,6 +60,7 @@ func (g *GoBGPServer) GetPeerState(ctx context.Context) (types.GetPeerStateRespo
 			peerState.LocalAsn = int64(peer.Conf.LocalAsn)
 			peerState.PeerAddress = peer.Conf.NeighborAddress
 			peerState.PeerAsn = int64(peer.Conf.PeerAsn)
+			peerState.TCPPasswordEnabled = peer.Conf.AuthPassword != ""
 		}
 
 		if peer.State != nil {

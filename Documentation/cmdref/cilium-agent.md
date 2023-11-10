@@ -30,11 +30,11 @@ cilium-agent [flags]
       --bpf-ct-global-any-max int                                 Maximum number of entries in non-TCP CT table (default 262144)
       --bpf-ct-global-tcp-max int                                 Maximum number of entries in TCP CT table (default 524288)
       --bpf-ct-timeout-regular-any duration                       Timeout for entries in non-TCP CT table (default 1m0s)
-      --bpf-ct-timeout-regular-tcp duration                       Timeout for established entries in TCP CT table (default 6h0m0s)
+      --bpf-ct-timeout-regular-tcp duration                       Timeout for established entries in TCP CT table (default 2h13m20s)
       --bpf-ct-timeout-regular-tcp-fin duration                   Teardown timeout for entries in TCP CT table (default 10s)
       --bpf-ct-timeout-regular-tcp-syn duration                   Establishment timeout for entries in TCP CT table (default 1m0s)
       --bpf-ct-timeout-service-any duration                       Timeout for service entries in non-TCP CT table (default 1m0s)
-      --bpf-ct-timeout-service-tcp duration                       Timeout for established service entries in TCP CT table (default 6h0m0s)
+      --bpf-ct-timeout-service-tcp duration                       Timeout for established service entries in TCP CT table (default 2h13m20s)
       --bpf-ct-timeout-service-tcp-grace duration                 Timeout for graceful shutdown of service entries in TCP CT table (default 1m0s)
       --bpf-fragments-map-max int                                 Maximum number of entries in fragments tracking map (default 8192)
       --bpf-lb-acceleration string                                BPF load balancing acceleration via XDP ("native", "disabled") (default "disabled")
@@ -60,9 +60,10 @@ cilium-agent [flags]
       --certificates-directory string                             Root directory to find certificates specified in L7 TLS policy enforcement (default "/var/run/cilium/certs")
       --cgroup-root string                                        Path to Cgroup2 filesystem
       --cluster-health-port int                                   TCP port for cluster-wide network connectivity health API (default 4240)
-      --cluster-id int                                            Unique identifier of the cluster
+      --cluster-id uint32                                         Unique identifier of the cluster
       --cluster-name string                                       Name of the cluster (default "default")
       --clustermesh-config string                                 Path to the ClusterMesh configuration directory
+      --clustermesh-ip-identities-sync-timeout duration           Timeout waiting for the initial synchronization of IPs and identities from remote clusters before local endpoints regeneration (default 1m0s)
       --cni-chaining-mode string                                  Enable CNI chaining with the specified plugin (default "none")
       --cni-chaining-target string                                CNI network name into which to insert the Cilium chained configuration. Use '*' to select any network.
       --cni-exclusive                                             Whether to remove other CNI configurations
@@ -70,6 +71,7 @@ cilium-agent [flags]
       --config string                                             Configuration file (default "$HOME/ciliumd.yaml")
       --config-dir string                                         Configuration directory that contains a file for each option
       --conntrack-gc-interval duration                            Overwrite the connection-tracking garbage collection interval
+      --conntrack-gc-max-interval duration                        Set the maximum interval for the connection-tracking garbage collection
       --controller-group-metrics strings                          List of controller group names for which to to enable metrics. Accepts 'all' and 'none'. The set of controller group names available is not guaranteed to be stable between Cilium versions.
       --crd-wait-timeout duration                                 Cilium will exit if CRDs are not available within this duration upon startup (default 5m0s)
       --datapath-mode string                                      Datapath mode name (default "veth")
@@ -143,7 +145,6 @@ cilium-agent [flags]
       --enable-pmtu-discovery                                     Enable path MTU discovery to send ICMP fragmentation-needed replies to the client
       --enable-policy string                                      Enable policy enforcement (default "default")
       --enable-recorder                                           Enable BPF datapath pcap recorder
-      --enable-remote-node-identity                               Enable use of remote node identity (default true)
       --enable-runtime-device-detection                           Enable runtime device detection and datapath reconfiguration (experimental)
       --enable-sctp                                               Enable SCTP support (beta)
       --enable-service-topology                                   Enable support for service topology aware hints
@@ -161,6 +162,7 @@ cilium-agent [flags]
       --encrypt-node                                              Enables encrypting traffic from non-Cilium pods and host networking (only supported with WireGuard, beta)
       --encryption-strict-mode-allow-remote-node-identities       Allows unencrypted traffic from pods to remote node identities within the strict mode CIDR. This is required when tunneling is used or direct routing is used and the node CIDR and pod CIDR overlap.
       --encryption-strict-mode-cidr string                        In strict-mode encryption, all unencrypted traffic coming from this CIDR and going to this same CIDR will be dropped
+      --endpoint-bpf-prog-watchdog-interval duration              Interval to trigger endpoint BPF programs load check watchdog (default 30s)
       --endpoint-queue-size int                                   Size of EventQueue per-endpoint (default 25)
       --endpoint-status strings                                   Enable additional CiliumEndpoint status features (controllers,health,log,policy,state)
       --envoy-config-timeout duration                             Timeout duration for Envoy Config acknowledgements (default 2m0s)
@@ -193,7 +195,12 @@ cilium-agent [flags]
       --hubble-prefer-ipv6                                        Prefer IPv6 addresses for announcing nodes when both address types are available.
       --hubble-recorder-sink-queue-size int                       Queue size of each Hubble recorder sink (default 1024)
       --hubble-recorder-storage-path string                       Directory in which pcap files created via the Hubble Recorder API are stored (default "/var/run/cilium/pcaps")
-      --hubble-redact strings                                     List of Hubble redact options
+      --hubble-redact-enabled                                     Hubble redact sensitive information from flows
+      --hubble-redact-http-headers-allow strings                  HTTP headers to keep visible in flows
+      --hubble-redact-http-headers-deny strings                   HTTP headers to redact from flows
+      --hubble-redact-http-urlquery                               Hubble redact http URL query from flows
+      --hubble-redact-http-userinfo                               Hubble redact http user info from flows (default true)
+      --hubble-redact-kafka-apikey                                Hubble redact Kafka API key from flows
       --hubble-skip-unknown-cgroup-ids                            Skip Hubble events with unknown cgroup ids (default true)
       --hubble-socket-path string                                 Set hubble's socket path to listen for connections (default "/var/run/cilium/hubble.sock")
       --hubble-tls-cert-file string                               Path to the public key file for the Hubble server. The file must contain PEM encoded data.
@@ -202,12 +209,12 @@ cilium-agent [flags]
       --identity-allocation-mode string                           Method to use for identity allocation (default "kvstore")
       --identity-change-grace-period duration                     Time to wait before using new identity on endpoint identity change (default 5s)
       --identity-restore-grace-period duration                    Time to wait before releasing unused restored CIDR identities during agent restart (default 10m0s)
-      --install-egress-gateway-routes                             Install egress gateway IP rules and routes in order to properly steer egress gateway traffic to the correct ENI interface
       --install-no-conntrack-iptables-rules                       Install Iptables rules to skip netfilter connection tracking on all pod traffic. This option is only effective when Cilium is running in direct routing and full KPR mode. Moreover, this option cannot be enabled when Cilium is running in a managed Kubernetes environment or in a chained CNI setup.
       --ip-allocation-timeout duration                            Time after which an incomplete CIDR allocation is considered failed (default 2m0s)
       --ip-masq-agent-config-path string                          ip-masq-agent configuration file path (default "/etc/config/ip-masq-agent")
       --ipam string                                               Backend to use for IPAM (default "cluster-pool")
       --ipam-cilium-node-update-rate duration                     Maximum rate at which the CiliumNode custom resource is updated (default 15s)
+      --ipam-default-ip-pool string                               Name of the default IP Pool when using multi-pool (default "default")
       --ipam-multi-pool-pre-allocation map                        Defines the minimum number of IPs a node should pre-allocate from each pool (default default=8)
       --ipsec-key-file string                                     Path to IPSec key file
       --ipsec-key-rotation-duration duration                      Maximum duration of the IPsec key rotation. The previous key will be removed after that delay. (default 5m0s)
@@ -257,6 +264,7 @@ cilium-agent [flags]
       --log-driver strings                                        Logging endpoints to use for example syslog
       --log-opt map                                               Log driver options for cilium-agent, configmap example for syslog driver: {"syslog.level":"info","syslog.facility":"local5","syslog.tag":"cilium-agent"}
       --log-system-load                                           Enable periodic logging of system load
+      --max-connected-clusters uint32                             Maximum number of clusters to be connected in a clustermesh. Increasing this value will reduce the maximum number of identities available. Valid configurations are [255, 511]. (default 255)
       --mesh-auth-enabled                                         Enable authentication processing & garbage collection (beta) (default true)
       --mesh-auth-gc-interval duration                            Interval in which auth entries are attempted to be garbage collected (default 5m0s)
       --mesh-auth-mutual-connect-timeout duration                 Timeout for connecting to the remote node TCP socket (default 5s)
@@ -274,7 +282,9 @@ cilium-agent [flags]
       --node-encryption-opt-out-labels string                     Label selector for nodes which will opt-out of node-to-node encryption (default "node-role.kubernetes.io/control-plane")
       --node-port-bind-protection                                 Reject application bind(2) requests to service ports in the NodePort range (default true)
       --node-port-range strings                                   Set the min/max NodePort port range (default [30000,32767])
+      --nodeport-addresses strings                                A whitelist of CIDRs to limit which IPs are used for NodePort. If not set, primary IPv4 and/or IPv6 address of each native device is used.
       --policy-audit-mode                                         Enable policy audit (non-drop) mode
+      --policy-cidr-match-mode strings                            The entities that can be selected by CIDR policy. Supported values: 'nodes'
       --policy-queue-size int                                     Size of queues for policy-related events (default 100)
       --pprof                                                     Enable serving pprof debugging API
       --pprof-address string                                      Address that pprof listens on (default "localhost")
@@ -316,6 +326,7 @@ cilium-agent [flags]
       --vtep-endpoint strings                                     List of VTEP IP addresses
       --vtep-mac strings                                          List of VTEP MAC addresses for forwarding traffic outside the cluster
       --vtep-mask string                                          VTEP CIDR Mask for all VTEP CIDRs (default "255.255.255.0")
+      --wireguard-persistent-keepalive duration                   The Wireguard keepalive interval as a Go duration string
       --write-cni-conf-when-ready string                          Write the CNI configuration to the specified path when agent is ready
 ```
 

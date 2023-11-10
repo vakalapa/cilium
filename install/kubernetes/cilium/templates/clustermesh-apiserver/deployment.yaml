@@ -7,6 +7,10 @@ kind: Deployment
 metadata:
   name: clustermesh-apiserver
   namespace: {{ .Release.Namespace }}
+  {{- with .Values.clustermesh.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   labels:
     k8s-app: clustermesh-apiserver
     app.kubernetes.io/part-of: cilium
@@ -151,6 +155,7 @@ spec:
         command:
         - /usr/bin/clustermesh-apiserver
         args:
+        - clustermesh
         {{- if .Values.debug.enabled }}
         - --debug
         {{- end }}
@@ -158,6 +163,9 @@ spec:
         - --cluster-id=$(CLUSTER_ID)
         - --kvstore-opt
         - etcd.config=/var/lib/cilium/etcd-config.yaml
+        {{- if hasKey .Values.clustermesh "maxConnectedClusters" }}
+        - --max-connected-clusters={{ .Values.clustermesh.maxConnectedClusters }}
+        {{- end }}
         {{- if ne .Values.clustermesh.apiserver.tls.authMode "legacy" }}
         - --cluster-users-enabled
         - --cluster-users-config-path=/var/lib/cilium/etcd-config/users.yaml
@@ -229,11 +237,12 @@ spec:
         {{- end }}
       {{- if .Values.clustermesh.apiserver.kvstoremesh.enabled }}
       - name: kvstoremesh
-        image: {{ include "cilium.image" .Values.clustermesh.apiserver.kvstoremesh.image | quote }}
-        imagePullPolicy: {{ .Values.clustermesh.apiserver.kvstoremesh.image.pullPolicy }}
+        image: {{ include "cilium.image" .Values.clustermesh.apiserver.image | quote }}
+        imagePullPolicy: {{ .Values.clustermesh.apiserver.image.pullPolicy }}
         command:
-        - /usr/bin/kvstoremesh
+        - /usr/bin/clustermesh-apiserver
         args:
+        - kvstoremesh
         {{- if .Values.debug.enabled }}
         - --debug
         {{- end }}
@@ -243,6 +252,9 @@ spec:
         - --kvstore-opt=etcd.qps=100
         - --kvstore-opt=etcd.maxInflight=10
         - --clustermesh-config=/var/lib/cilium/clustermesh
+        {{- if hasKey .Values.clustermesh "maxConnectedClusters" }}
+        - --max-connected-clusters={{ .Values.clustermesh.maxConnectedClusters }}
+        {{- end }}
         {{- if .Values.clustermesh.apiserver.metrics.kvstoremesh.enabled }}
         - --prometheus-serve-addr=:{{ .Values.clustermesh.apiserver.metrics.kvstoremesh.port }}
         - --controller-group-metrics=all

@@ -71,7 +71,6 @@ func (k *K8sWatcher) addK8sNetworkPolicyV1(k8sNP *slim_networkingv1.NetworkPolic
 	scopedLog := log.WithField(logfields.K8sAPIVersion, k8sNP.TypeMeta.APIVersion)
 	rules, err := k8s.ParseNetworkPolicy(k8sNP)
 	if err != nil {
-		metrics.PolicyImportErrorsTotal.Inc() // Deprecated in Cilium 1.14, to be removed in 1.15.
 		metrics.PolicyChangeTotal.WithLabelValues(metrics.LabelValueOutcomeFail).Inc()
 		scopedLog.WithError(err).WithFields(logrus.Fields{
 			logfields.CiliumNetworkPolicy: logfields.Repr(k8sNP),
@@ -79,6 +78,10 @@ func (k *K8sWatcher) addK8sNetworkPolicyV1(k8sNP *slim_networkingv1.NetworkPolic
 		return err
 	}
 	scopedLog = scopedLog.WithField(logfields.K8sNetworkPolicyName, k8sNP.ObjectMeta.Name)
+
+	if k8s.NetworkPolicyHasEndPort(k8sNP) {
+		scopedLog.Warning("EndPort in kubernetes NetworkPolicy is not supported")
+	}
 
 	opts := policy.AddOptions{
 		Replace: true,
@@ -90,7 +93,6 @@ func (k *K8sWatcher) addK8sNetworkPolicyV1(k8sNP *slim_networkingv1.NetworkPolic
 		),
 	}
 	if _, err := k.policyManager.PolicyAdd(rules, &opts); err != nil {
-		metrics.PolicyImportErrorsTotal.Inc() // Deprecated in Cilium 1.14, to be removed in 1.15.
 		metrics.PolicyChangeTotal.WithLabelValues(metrics.LabelValueOutcomeFail).Inc()
 		scopedLog.WithError(err).WithFields(logrus.Fields{
 			logfields.CiliumNetworkPolicy: logfields.Repr(rules),

@@ -57,6 +57,8 @@ var (
 	Backend6MapV3 *bpf.Map
 	// RevNat6Map is the IPv6 LB reverse NAT BPF map.
 	RevNat6Map *bpf.Map
+	// SockRevNat6Map is the IPv6 LB sock reverse NAT BPF map.
+	SockRevNat6Map *bpf.Map
 )
 
 // The compile-time check for whether the structs implement the interfaces
@@ -186,7 +188,7 @@ func (k *Service6Key) ToHost() ServiceKey {
 	return &h
 }
 
-// Service6Value must match 'struct lb6_service_v2' in "bpf/lib/common.h".
+// Service6Value must match 'struct lb6_service' in "bpf/lib/common.h".
 type Service6Value struct {
 	BackendID uint32    `align:"$union0"`
 	Count     uint16    `align:"count"`
@@ -224,7 +226,7 @@ func (s *Service6Value) SetSessionAffinityTimeoutSec(t uint32) {
 
 func (s *Service6Value) SetL7LBProxyPort(port uint16) {
 	// Go doesn't support union types, so we use BackendID to access the
-	// lb4_service.l7_lb_proxy_port field
+	// lb6_service.l7_lb_proxy_port field
 	s.BackendID = uint32(byteorder.HostToNetwork16(port))
 }
 
@@ -328,8 +330,8 @@ type Backend6ValueV3 struct {
 	Port      uint16          `align:"port"`
 	Proto     u8proto.U8proto `align:"proto"`
 	Flags     uint8           `align:"flags"`
-	ClusterID uint8           `align:"cluster_id"`
-	Pad       pad3uint8       `align:"pad"`
+	ClusterID uint16          `align:"cluster_id"`
+	Pad       pad2uint8       `align:"pad"`
 }
 
 func NewBackend6ValueV3(addrCluster cmtypes.AddrCluster, port uint16, proto u8proto.U8proto, state loadbalancer.BackendState) (*Backend6ValueV3, error) {
@@ -441,9 +443,9 @@ func (b *Backend6) GetValue() BackendValue { return b.Value }
 // SockRevNat6Key is the tuple with address, port and cookie used as key in
 // the reverse NAT sock map.
 type SockRevNat6Key struct {
-	cookie  uint64     `align:"cookie"`
-	address types.IPv6 `align:"address"`
-	port    int16      `align:"port"`
+	Cookie  uint64     `align:"cookie"`
+	Address types.IPv6 `align:"address"`
+	Port    int16      `align:"port"`
 	_       [6]byte
 }
 
@@ -460,9 +462,22 @@ type SockRevNat6Value struct {
 // SizeofSockRevNat6Value is the size of type SockRevNat6Value.
 const SizeofSockRevNat6Value = int(unsafe.Sizeof(SockRevNat6Value{}))
 
+func (k *SockRevNat6Key) Map() *bpf.Map { return SockRevNat6Map }
+
+func NewSockRevNat6Key(cookie uint64, addr net.IP, port uint16) *SockRevNat6Key {
+	var key SockRevNat6Key
+
+	key.Cookie = cookie
+	key.Port = int16(byteorder.NetworkToHost16(port))
+	ipv6Array := addr.To16()
+	copy(key.Address[:], ipv6Array[:])
+
+	return &key
+}
+
 // String converts the key into a human readable string format.
 func (k *SockRevNat6Key) String() string {
-	return fmt.Sprintf("[%s]:%d, %d", k.address, k.port, k.cookie)
+	return fmt.Sprintf("[%s]:%d, %d", k.Address, k.Port, k.Cookie)
 }
 
 func (k *SockRevNat6Key) New() bpf.MapKey { return &SockRevNat6Key{} }
@@ -476,12 +491,12 @@ func (v *SockRevNat6Value) New() bpf.MapValue { return &SockRevNat6Value{} }
 
 // CreateSockRevNat6Map creates the reverse NAT sock map.
 func CreateSockRevNat6Map() error {
-	sockRevNat6Map := bpf.NewMap(SockRevNat6MapName,
+	SockRevNat6Map = bpf.NewMap(SockRevNat6MapName,
 		ebpf.LRUHash,
 		&SockRevNat6Key{},
 		&SockRevNat6Value{},
 		MaxSockRevNat6MapEntries,
 		0,
 	).WithPressureMetric()
-	return sockRevNat6Map.Create()
+	return SockRevNat6Map.OpenOrCreate()
 }

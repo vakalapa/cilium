@@ -7,7 +7,6 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"time"
 
 	"github.com/cilium/cilium/pkg/api/helpers"
 	eniTypes "github.com/cilium/cilium/pkg/aws/eni/types"
@@ -18,6 +17,7 @@ import (
 	"github.com/cilium/cilium/pkg/ipam/service/ipallocator"
 	ipamTypes "github.com/cilium/cilium/pkg/ipam/types"
 	"github.com/cilium/cilium/pkg/lock"
+	"github.com/cilium/cilium/pkg/time"
 
 	"github.com/google/uuid"
 	log "github.com/sirupsen/logrus"
@@ -522,6 +522,39 @@ func (e *API) UnassignENIPrefixes(ctx context.Context, eniID string, prefixes []
 		return nil
 	}
 	return fmt.Errorf("Unable to find ENI with ID %s", eniID)
+}
+
+func (e *API) GetInstance(ctx context.Context, vpcs ipamTypes.VirtualNetworkMap, subnets ipamTypes.SubnetMap, instanceID string) (*ipamTypes.Instance, error) {
+	instance := ipamTypes.Instance{}
+	instance.Interfaces = map[string]ipamTypes.InterfaceRevision{}
+
+	e.mutex.RLock()
+	defer e.mutex.RUnlock()
+
+	for id, enis := range e.enis {
+		if id != instanceID {
+			continue
+		}
+		for ifaceID, eni := range enis {
+			if subnets != nil {
+				if subnet, ok := subnets[eni.Subnet.ID]; ok && subnet.CIDR != nil {
+					eni.Subnet.CIDR = subnet.CIDR.String()
+				}
+			}
+
+			if vpcs != nil {
+				if vpc, ok := vpcs[eni.VPC.ID]; ok {
+					eni.VPC.PrimaryCIDR = vpc.PrimaryCIDR
+					eni.VPC.CIDRs = vpc.CIDRs
+				}
+			}
+
+			eniRevision := ipamTypes.InterfaceRevision{Resource: eni.DeepCopy()}
+			instance.Interfaces[ifaceID] = eniRevision
+		}
+	}
+
+	return &instance, nil
 }
 
 func (e *API) GetInstances(ctx context.Context, vpcs ipamTypes.VirtualNetworkMap, subnets ipamTypes.SubnetMap) (*ipamTypes.InstanceMap, error) {

@@ -4,7 +4,6 @@
 #include "common.h"
 #include <bpf/ctx/unspec.h>
 #include <bpf/api.h>
-#include "lib/common.h"
 #include "pktgen.h"
 
 #define ENABLE_IPV4 1
@@ -24,6 +23,7 @@
 #define HOST_NETNS_COOKIE 0
 
 #include "bpf_sock.c"
+#include "lib/common.h"
 
 #include "lib/ipcache.h"
 
@@ -119,7 +119,7 @@ int test_v4_check(__maybe_unused struct xdp_md *ctx)
 	test_init();
 
 	TEST("setup", {
-		info = ipcache_lookup4(&IPCACHE_MAP, bpf_htonl(HOST_IP), V4_CACHE_KEY_LEN, 0);
+		info = lookup_ip4_remote_endpoint(bpf_htonl(HOST_IP), 0);
 		assert(info);
 	});
 
@@ -337,7 +337,7 @@ int test_v6_check(__maybe_unused struct xdp_md *ctx)
 	test_init();
 
 	TEST("setup", {
-		info = ipcache_lookup6(&IPCACHE_MAP, &HOST_IP6, V6_CACHE_KEY_LEN, 0);
+		info = lookup_ip6_remote_endpoint(&HOST_IP6, 0);
 		assert(info);
 	});
 

@@ -34,7 +34,7 @@ const (
 	Backend4MapName = "cilium_lb4_backends"
 	// Backend4MapV2Name is the name of the IPv4 LB backends v2 BPF map.
 	Backend4MapV2Name = "cilium_lb4_backends_v2"
-	// Backend4MapV2Name is the name of the IPv4 LB backends v3 BPF map.
+	// Backend4MapV3Name is the name of the IPv4 LB backends v3 BPF map.
 	Backend4MapV3Name = "cilium_lb4_backends_v3"
 	// RevNat4MapName is the name of the IPv4 LB reverse NAT BPF map.
 	RevNat4MapName = "cilium_lb4_reverse_nat"
@@ -57,6 +57,8 @@ var (
 	Backend4MapV3 *bpf.Map
 	// RevNat4Map is the IPv4 LB reverse NAT BPF map.
 	RevNat4Map *bpf.Map
+	// SockRevNat4Map is the IPv4 LB sock reverse NAT BPF map.
+	SockRevNat4Map *bpf.Map
 )
 
 // initSVC constructs the IPv4 & IPv6 LB BPF maps used for Services. The maps
@@ -222,8 +224,6 @@ func (v *RevNat4Value) New() bpf.MapValue { return &RevNat4Value{} }
 
 type pad2uint8 [2]uint8
 
-type pad3uint8 [3]uint8
-
 // Service4Key must match 'struct lb4_key' in "bpf/lib/common.h".
 type Service4Key struct {
 	Address     types.IPv4 `align:"address"`
@@ -289,7 +289,7 @@ func (k *Service4Key) ToHost() ServiceKey {
 	return &h
 }
 
-// Service4Value must match 'struct lb4_service_v2' in "bpf/lib/common.h".
+// Service4Value must match 'struct lb4_service' in "bpf/lib/common.h".
 type Service4Value struct {
 	BackendID uint32    `align:"$union0"`
 	Count     uint16    `align:"count"`
@@ -433,8 +433,8 @@ type Backend4ValueV3 struct {
 	Port      uint16          `align:"port"`
 	Proto     u8proto.U8proto `align:"proto"`
 	Flags     uint8           `align:"flags"`
-	ClusterID uint8           `align:"cluster_id"`
-	Pad       pad3uint8       `align:"pad"`
+	ClusterID uint16          `align:"cluster_id"`
+	Pad       pad2uint8       `align:"pad"`
 }
 
 func NewBackend4ValueV3(addrCluster cmtypes.AddrCluster, port uint16, proto u8proto.U8proto, state loadbalancer.BackendState) (*Backend4ValueV3, error) {
@@ -454,7 +454,7 @@ func NewBackend4ValueV3(addrCluster cmtypes.AddrCluster, port uint16, proto u8pr
 		Port:      port,
 		Proto:     proto,
 		Flags:     flags,
-		ClusterID: uint8(clusterID),
+		ClusterID: uint16(clusterID),
 	}
 
 	ip4Array := addr.As4()
@@ -546,41 +546,52 @@ func (b *Backend4) GetValue() BackendValue { return b.Value }
 // SockRevNat4Key is the tuple with address, port and cookie used as key in
 // the reverse NAT sock map.
 type SockRevNat4Key struct {
-	cookie  uint64     `align:"cookie"`
-	address types.IPv4 `align:"address"`
-	port    int16      `align:"port"`
+	Cookie  uint64     `align:"cookie"`
+	Address types.IPv4 `align:"address"`
+	Port    int16      `align:"port"`
 	_       int16
 }
 
 // SockRevNat4Value is an entry in the reverse NAT sock map.
 type SockRevNat4Value struct {
-	address     types.IPv4 `align:"address"`
-	port        int16      `align:"port"`
-	revNatIndex uint16     `align:"rev_nat_index"`
+	Address     types.IPv4 `align:"address"`
+	Port        int16      `align:"port"`
+	RevNatIndex uint16     `align:"rev_nat_index"`
+}
+
+func (k *SockRevNat4Key) Map() *bpf.Map { return SockRevNat4Map }
+
+func NewSockRevNat4Key(cookie uint64, addr net.IP, port uint16) *SockRevNat4Key {
+	var key SockRevNat4Key
+	key.Cookie = cookie
+	key.Port = int16(byteorder.NetworkToHost16(port))
+	copy(key.Address[:], addr.To4())
+
+	return &key
 }
 
 // String converts the key into a human readable string format.
 func (k *SockRevNat4Key) String() string {
-	return fmt.Sprintf("[%s]:%d, %d", k.address, k.port, k.cookie)
+	return fmt.Sprintf("[%s]:%d, %d", k.Address, k.Port, k.Cookie)
 }
 
 func (k *SockRevNat4Key) New() bpf.MapKey { return &SockRevNat4Key{} }
 
 // String converts the value into a human readable string format.
 func (v *SockRevNat4Value) String() string {
-	return fmt.Sprintf("[%s]:%d, %d", v.address, v.port, v.revNatIndex)
+	return fmt.Sprintf("[%s]:%d, %d", v.Address, v.Port, v.RevNatIndex)
 }
 
 func (v *SockRevNat4Value) New() bpf.MapValue { return &SockRevNat4Value{} }
 
 // CreateSockRevNat4Map creates the reverse NAT sock map.
 func CreateSockRevNat4Map() error {
-	sockRevNat4Map := bpf.NewMap(SockRevNat4MapName,
+	SockRevNat4Map = bpf.NewMap(SockRevNat4MapName,
 		ebpf.LRUHash,
 		&SockRevNat4Key{},
 		&SockRevNat4Value{},
 		MaxSockRevNat4MapEntries,
 		0,
 	).WithPressureMetric()
-	return sockRevNat4Map.Create()
+	return SockRevNat4Map.OpenOrCreate()
 }

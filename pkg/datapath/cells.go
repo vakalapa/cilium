@@ -14,7 +14,9 @@ import (
 	"github.com/cilium/cilium/pkg/datapath/l2responder"
 	"github.com/cilium/cilium/pkg/datapath/link"
 	linuxdatapath "github.com/cilium/cilium/pkg/datapath/linux"
+	"github.com/cilium/cilium/pkg/datapath/linux/bigtcp"
 	dpcfg "github.com/cilium/cilium/pkg/datapath/linux/config"
+	"github.com/cilium/cilium/pkg/datapath/linux/modules"
 	"github.com/cilium/cilium/pkg/datapath/linux/utime"
 	"github.com/cilium/cilium/pkg/datapath/tables"
 	"github.com/cilium/cilium/pkg/datapath/types"
@@ -33,6 +35,9 @@ import (
 
 // Datapath provides the privileged operations to apply control-plane
 // decision to the kernel.
+//
+// For integration testing a fake counterpart of this module is defined
+// in pkg/datapath/fake/cells.go.
 var Cell = cell.Module(
 	"datapath",
 	"Datapath",
@@ -48,6 +53,12 @@ var Cell = cell.Module(
 
 	// The monitor agent, which multicasts cilium and agent events to its subscribers.
 	monitorAgent.Cell,
+
+	// The modules manager to search and load kernel modules.
+	modules.Cell,
+
+	// Manages Cilium-specific iptables rules.
+	iptables.Cell,
 
 	cell.Provide(
 		newWireguardAgent,
@@ -71,6 +82,9 @@ var Cell = cell.Module(
 
 	// This cell provides the object used to write the headers for datapath program types.
 	dpcfg.Cell,
+
+	// BIG TCP increases GSO/GRO limits when enabled.
+	bigtcp.Cell,
 
 	cell.Provide(func(dp types.Datapath) types.NodeIDHandler {
 		return dp.NodeIDs()
@@ -120,20 +134,7 @@ func newDatapath(params datapathParams) types.Datapath {
 		ProcFs:     option.Config.ProcFs,
 	}
 
-	iptablesManager := &iptables.IptablesManager{}
-
-	params.LC.Append(hive.Hook{
-		OnStart: func(hive.HookContext) error {
-			// FIXME enableIPForwarding should not live here
-			if err := enableIPForwarding(); err != nil {
-				log.Fatalf("enabling IP forwarding via sysctl failed: %s", err)
-			}
-
-			iptablesManager.Init()
-			return nil
-		}})
-
-	datapath := linuxdatapath.NewDatapath(datapathConfig, iptablesManager, params.WgAgent, params.NodeMap, params.ConfigWriter)
+	datapath := linuxdatapath.NewDatapath(datapathConfig, params.IptablesManager, params.WgAgent, params.NodeMap, params.ConfigWriter)
 
 	params.LC.Append(hive.Hook{
 		OnStart: func(hive.HookContext) error {
@@ -161,6 +162,10 @@ type datapathParams struct {
 	// This is required until option.Config.GetDevices() has been removed and
 	// uses of it converted to Table[Device].
 	DeviceManager *linuxdatapath.DeviceManager
+
+	ModulesManager *modules.Manager
+
+	IptablesManager *iptables.Manager
 
 	ConfigWriter types.ConfigWriter
 }

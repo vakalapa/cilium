@@ -86,6 +86,18 @@ const (
 	// HubbleRecorderSinkQueueSize is the queue size for each recorder sink
 	HubbleRecorderSinkQueueSize = 1024
 
+	// HubbleRedactEnabled controls if sensitive information will be redacted from L7 flows
+	HubbleRedactEnabled = false
+
+	// HubbleRedactHttpURLQuery controls if the URL query will be redacted from flows
+	HubbleRedactHttpURLQuery = false
+
+	// HubbleRedactHttpUserInfo controls if the user info will be redacted from flows
+	HubbleRedactHttpUserInfo = true
+
+	// HubbleRedactKafkaApiKey controls if the Kafka API key will be redacted from flows
+	HubbleRedactKafkaApiKey = false
+
 	// MonitorSockPath1_2 is the path to the UNIX domain socket used to
 	// distribute BPF and agent events to listeners.
 	// This is the 1.2 protocol version.
@@ -169,6 +181,10 @@ const (
 	// ExecTimeout is a timeout for executing commands.
 	ExecTimeout = 300 * time.Second
 
+	// MaxInternalTimerDelay does not enforce a maximum on timer values in
+	// the agent by default.
+	MaxInternalTimerDelay = 0 * time.Second
+
 	// StatusCollectorInterval is the interval between a probe invocations
 	StatusCollectorInterval = 5 * time.Second
 
@@ -206,9 +222,6 @@ const (
 
 	// EnableHostLegacyRouting is the default value for using the old routing path via stack.
 	EnableHostLegacyRouting = false
-
-	// K8sEnableEndpointSlice is the default value for k8s EndpointSlice feature.
-	K8sEnableEndpointSlice = true
 
 	// PreAllocateMaps is the default value for BPF map preallocation
 	PreAllocateMaps = true
@@ -374,9 +387,8 @@ const (
 	// CiliumNode.Spec.IPAM.PreAllocate if no value is set
 	IPAMPreAllocation = 8
 
-	// IPAMMultiPoolPreAllocation is the default value for multi-pool IPAM
-	// pre-allocations
-	IPAMMultiPoolPreAllocation = "default=8"
+	// IPAMDefaultIPPool is the default value for the multi-pool default pool name.
+	IPAMDefaultIPPool = "default"
 
 	// ENIFirstInterfaceIndex is the default value for
 	// CiliumNode.Spec.ENI.FirstInterfaceIndex if no value is set.
@@ -417,16 +429,6 @@ const (
 
 	// IPAMAPIQPSLimit is the default QPS limit when rate limiting access to external APIs
 	IPAMAPIQPSLimit = 4.0
-
-	// IPAMPodCIDRAllocationThreshold is the default value for
-	// CiliumNode.Spec.IPAM.PodCIDRAllocationThreshold if no value is set
-	// Defaults to 8, which is similar to IPAMPreAllocation
-	IPAMPodCIDRAllocationThreshold = 8
-
-	// IPAMPodCIDRReleaseThreshold is the default value for
-	// CiliumNode.Spec.IPAM.PodCIDRReleaseThreshold if no value is set
-	// Defaults to 16, which is 2x the allocation threshold to avoid flapping
-	IPAMPodCIDRReleaseThreshold = 16
 
 	// AutoCreateCiliumNodeResource enables automatic creation of a
 	// CiliumNode resource for the local node
@@ -545,6 +547,13 @@ const (
 
 	// EnableK8sNetworkPolicy enables support for K8s NetworkPolicy.
 	EnableK8sNetworkPolicy = true
+
+	// MaxConnectedClusters sets the maximum number of clusters that can be
+	// connected in a clustermesh.
+	// The value is used to determine the bit allocation for cluster ID and
+	// identity in a numeric identity. Values > 255 will decrease the number of
+	// allocatable identities.
+	MaxConnectedClusters = 255
 )
 
 var (
@@ -577,4 +586,6 @@ var (
 		"cilium_lb6_source_range":   "enabled,128,0",
 		"cilium_lb6_affinity_match": "enabled,128,0",
 	}
+
+	PolicyCIDRMatchMode = []string{}
 )

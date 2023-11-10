@@ -122,6 +122,8 @@ var (
 		"ipv6NativeRoutingCIDR":  IPv6NativeRoutingCIDR,
 
 		"ipam.operator.clusterPoolIPv6PodCIDRList": "fd02::/112",
+
+		"extraConfig.max-internal-timer-delay": "5s",
 	}
 
 	eksChainingHelmOverrides = map[string]string{
@@ -225,25 +227,6 @@ var (
 		"cep",
 	}
 )
-
-// HelmOverride returns the value of a Helm override option for the currently
-// enabled CNI_INTEGRATION
-func HelmOverride(option string) string {
-	integration := strings.ToLower(os.Getenv("CNI_INTEGRATION"))
-	if overrides, exists := helmOverrides[integration]; exists {
-		return overrides[option]
-	}
-	return ""
-}
-
-// NativeRoutingEnabled returns true when native routing is enabled for a
-// particular CNI_INTEGRATION
-func NativeRoutingEnabled() bool {
-	tunnelDisabled := HelmOverride("tunnel") == "disabled" ||
-		HelmOverride("routingMode") == "native"
-	gkeEnabled := HelmOverride("gke.enabled") == "true"
-	return tunnelDisabled || gkeEnabled
-}
 
 func Init() {
 	if config.CiliumTestConfig.CiliumImage != "" {
@@ -739,6 +722,34 @@ func (kub *Kubectl) GetCiliumHostEndpointState(ciliumPod string) (string, error)
 	}
 
 	return strings.TrimSpace(res.Stdout()), nil
+}
+
+// GetCiliumIdentityForIP returns the numeric identity for a given IP address
+// according to a node's BPF ipcache.
+func (kub *Kubectl) GetCiliumIdentityForIP(ciliumPod, ip string) (int, error) {
+	cmd := fmt.Sprintf("cilium-dbg bpf ipcache get %s", ip)
+	res := kub.CiliumExecContext(context.Background(), ciliumPod, cmd)
+	if !res.WasSuccessful() {
+		return 0, fmt.Errorf("unable to run command '%s' to retrieve state of host endpoint from %s: %s",
+			cmd, ciliumPod, res.OutputPrettyPrint())
+	}
+
+	// output looks like
+	// 172.19.0.2 maps to identity identity=16777217 encryptkey=0 tunnelendpoint=0.0.0.0
+	words := strings.Fields(res.Stdout())
+	if len(words) < 5 {
+		return 0, fmt.Errorf("could not parse output %s from command %s on from %s", res.Stdout(), cmd, ciliumPod)
+	}
+	kv := strings.SplitN(words[4], "=", 2)
+	if len(kv) < 2 {
+		return 0, fmt.Errorf("could not parse output %s from command %s on from %s", res.Stdout(), cmd, ciliumPod)
+	}
+
+	i, err := strconv.Atoi(kv[1])
+	if err != nil {
+		return 0, fmt.Errorf("could not parse output %s from command %s on from %s", res.Stdout(), cmd, ciliumPod)
+	}
+	return i, nil
 }
 
 // GetNumCiliumNodes returns the number of Kubernetes nodes running cilium
@@ -2911,9 +2922,15 @@ func (kub *Kubectl) CiliumExecContext(ctx context.Context, pod string, cmd strin
 	for i := 0; i < limitTimes; i++ {
 		res = execute()
 		switch res.GetExitCode() {
+		case 0:
+			// Command succeeded. Return the result.
+			return res
 		case -1, 126:
-			// Retry.
+			// The preceding comments indicate that these return codes may occur frequently.
+			// To prevent excessive log entries in the default case, we catch these errors here
+			// and retry the command without generating additional log entries.
 		default:
+			// Command failed. Log failure and retry.
 			kub.Logger().Warningf("command terminated with exit code %d on try %d", res.GetExitCode(), i)
 		}
 		time.Sleep(200 * time.Millisecond)

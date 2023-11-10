@@ -12,7 +12,6 @@ import (
 	"path"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/cilium/ebpf"
 	"github.com/sirupsen/logrus"
@@ -36,6 +35,7 @@ import (
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/policy"
 	"github.com/cilium/cilium/pkg/revert"
+	"github.com/cilium/cilium/pkg/time"
 	"github.com/cilium/cilium/pkg/types"
 	"github.com/cilium/cilium/pkg/u8proto"
 )
@@ -44,6 +44,12 @@ var (
 	endpointRegenerationRecoveryControllerGroup = controller.NewGroup("endpoint-regeneration-recovery")
 	syncAddressIdentityMappingControllerGroup   = controller.NewGroup("sync-address-identity-mapping")
 )
+
+// HasBPFPolicyMap returns true if policy map changes should be collected
+func (e *Endpoint) HasBPFPolicyMap() bool {
+	// Ingress Endpoint has no policy maps
+	return !e.isIngress
+}
 
 // GetNamedPort returns the port for the given name.
 // Must be called with e.mutex NOT held
@@ -214,7 +220,6 @@ func (e *Endpoint) regeneratePolicy() (*policyGenerateResult, error) {
 	stats := &policyRegenerationStatistics{}
 	stats.totalTime.Start()
 	defer func() {
-		stats.totalTime.End(err == nil)
 		e.updatePolicyRegenerationStatistics(stats, forcePolicyCompute, err)
 	}()
 
@@ -526,9 +531,10 @@ func (e *Endpoint) updateRealizedState(stats *regenerationStatistics, origDir st
 		return fmt.Errorf("error synchronizing endpoint BPF program directories: %s", err)
 	}
 
-	// Keep PolicyMap for this endpoint in sync with desired / realized state.
+	// Start periodic background full reconciliation of the policy map.
+	// Does nothing if it has already been started.
 	if !option.Config.DryMode {
-		e.syncPolicyMapController()
+		e.startSyncPolicyMapController()
 	}
 
 	if e.desiredPolicy != e.realizedPolicy {
@@ -651,6 +657,7 @@ func (e *Endpoint) RegenerateIfAlive(regenMetadata *regeneration.ExternalRegener
 // Should only be called with e.state at StateWaitingToRegenerate,
 // StateWaitingForIdentity, or StateRestoring
 func (e *Endpoint) Regenerate(regenMetadata *regeneration.ExternalRegenerationMetadata) <-chan bool {
+	hr := e.GetReporter("datapath-regenerate")
 	done := make(chan bool, 1)
 
 	var (
@@ -701,7 +708,9 @@ func (e *Endpoint) Regenerate(regenMetadata *regeneration.ExternalRegenerationMe
 
 			if regenError != nil && !errors.Is(regenError, context.Canceled) {
 				e.getLogger().WithError(regenError).Error("endpoint regeneration failed")
+				hr.Degraded("Endpoint regeneration failed", regenError)
 			}
+			hr.OK("Endpoint regeneration successful")
 		} else {
 			// This may be unnecessary(?) since 'closing' of the results
 			// channel means that event has been cancelled?
@@ -901,12 +910,6 @@ func (e *Endpoint) SetIdentity(identity *identityPkg.Identity, newEndpoint bool)
 	})
 }
 
-// GetCIDRPrefixLengths returns the sorted list of unique prefix lengths used
-// for CIDR policy or IPcache lookup from this endpoint.
-func (e *Endpoint) GetCIDRPrefixLengths() (s6, s4 []int) {
-	return e.owner.GetCIDRPrefixLengths()
-}
-
 // AnnotationsResolverCB provides an implementation for resolving the pod
 // annotations.
 type AnnotationsResolverCB func(ns, podName string) (proxyVisibility string, err error)
@@ -985,7 +988,7 @@ func (e *Endpoint) GetRealizedPolicyRuleLabelsForKey(key policy.Key) (
 	e.mutex.RLock()
 	defer e.mutex.RUnlock()
 
-	entry, ok := e.realizedPolicy.PolicyMapState[key]
+	entry, ok := e.realizedPolicy.GetPolicyMap().Get(key)
 	if !ok {
 		return nil, 0, false
 	}

@@ -8,9 +8,7 @@ import (
 
 	"github.com/davecgh/go-spew/spew"
 
-	"github.com/cilium/cilium/pkg/cidr"
 	"github.com/cilium/cilium/pkg/datapath/types"
-	ipamOption "github.com/cilium/cilium/pkg/ipam/option"
 	"github.com/cilium/cilium/pkg/lock"
 )
 
@@ -68,11 +66,14 @@ type Allocator interface {
 	// upstream or fails if no more IPs are available
 	AllocateNextWithoutSyncUpstream(owner string, pool Pool) (*AllocationResult, error)
 
-	// Dump returns a map of all allocated IPs with the IP represented as
-	// key in the map. Dump must also provide a status one-liner to
-	// represent the overall status, e.g. number of IPs allocated and
-	// overall health information if available.
-	Dump() (map[string]string, string)
+	// Dump returns a map of all allocated IPs per pool with the IP represented as key in the
+	// map. Dump must also provide a status one-liner to represent the overall status, e.g.
+	// number of IPs allocated and overall health information if available.
+	Dump() (map[Pool]map[string]string, string)
+
+	// Capacity returns the total IPAM allocator capacity (not the current
+	// available).
+	Capacity() uint64
 
 	// RestoreFinished marks the status of restoration as done
 	RestoreFinished()
@@ -119,29 +120,9 @@ func (ipam *IPAM) DebugStatus() string {
 	return str
 }
 
-// GetVpcCIDRs returns all the CIDRs associated with the VPC this node belongs to.
-// This works only cloud provider IPAM modes and returns nil for other modes.
-// sharedNodeStore must be initialized before calling this method.
-func (ipam *IPAM) GetVpcCIDRs() (vpcCIDRs []*cidr.CIDR) {
-	sharedNodeStore.mutex.RLock()
-	defer sharedNodeStore.mutex.RUnlock()
-	primary, secondary := deriveVpcCIDRs(sharedNodeStore.ownNode)
-	if primary == nil {
-		return nil
-	}
-	if secondary == nil {
-		return []*cidr.CIDR{primary}
-	}
-	return append(secondary, primary)
-}
-
 // Pool is the the IP pool from which to allocate.
 type Pool string
 
 func (p Pool) String() string {
 	return string(p)
 }
-
-const (
-	PoolDefault Pool = ipamOption.PoolDefault
-)

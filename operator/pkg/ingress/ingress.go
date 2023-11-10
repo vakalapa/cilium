@@ -6,7 +6,6 @@ package ingress
 import (
 	"context"
 	"fmt"
-	"strconv"
 	"strings"
 
 	"github.com/sirupsen/logrus"
@@ -26,6 +25,7 @@ import (
 	ciliumv2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	k8sClient "github.com/cilium/cilium/pkg/k8s/client"
 	"github.com/cilium/cilium/pkg/k8s/informer"
+	"github.com/cilium/cilium/pkg/k8s/resource"
 	slim_corev1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/api/core/v1"
 	slim_networkingv1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/api/networking/v1"
 	"github.com/cilium/cilium/pkg/k8s/utils"
@@ -45,6 +45,7 @@ const (
 type ingressAddedEvent struct {
 	ingress *slim_networkingv1.Ingress
 }
+
 type ingressUpdatedEvent struct {
 	oldIngress *slim_networkingv1.Ingress
 	newIngress *slim_networkingv1.Ingress
@@ -92,15 +93,19 @@ type Controller struct {
 	sharedLBServiceName     string
 	ciliumNamespace         string
 	defaultLoadbalancerMode string
-	isDefaultIngressClass   bool
-	defaultSecretNamespace  string
-	defaultSecretName       string
+
+	defaultSecretNamespace string
+	defaultSecretName      string
 
 	sharedLBStatus *slim_corev1.LoadBalancerStatus
 }
 
 // NewController returns a controller for ingress objects having ingressClassName as cilium
-func NewController(clientset k8sClient.Clientset, options ...Option) (*Controller, error) {
+func NewController(
+	clientset k8sClient.Clientset,
+	ingressClasses resource.Resource[*slim_networkingv1.IngressClass],
+	options ...Option,
+) (*Controller, error) {
 	opts := DefaultIngressOptions
 	for _, opt := range options {
 		if err := opt(&opts); err != nil {
@@ -121,8 +126,8 @@ func NewController(clientset k8sClient.Clientset, options ...Option) (*Controlle
 		defaultLoadbalancerMode: opts.DefaultLoadbalancerMode,
 		defaultSecretNamespace:  opts.DefaultSecretNamespace,
 		defaultSecretName:       opts.DefaultSecretName,
-		sharedTranslator:        ingressTranslation.NewSharedIngressTranslator(opts.SharedLBServiceName, opts.CiliumNamespace, opts.SecretsNamespace, opts.EnforcedHTTPS, opts.IdleTimeoutSeconds),
-		dedicatedTranslator:     ingressTranslation.NewDedicatedIngressTranslator(opts.SecretsNamespace, opts.EnforcedHTTPS, opts.IdleTimeoutSeconds),
+		sharedTranslator:        ingressTranslation.NewSharedIngressTranslator(opts.SharedLBServiceName, opts.CiliumNamespace, opts.SecretsNamespace, opts.EnforcedHTTPS, opts.UseProxyProtocol, opts.IdleTimeoutSeconds),
+		dedicatedTranslator:     ingressTranslation.NewDedicatedIngressTranslator(opts.SecretsNamespace, opts.EnforcedHTTPS, opts.UseProxyProtocol, opts.IdleTimeoutSeconds),
 	}
 	ic.ingressStore, ic.ingressInformer = informer.NewInformer(
 		utils.ListerWatcherFromTyped[*slim_networkingv1.IngressList](clientset.Slim().NetworkingV1().Ingresses(corev1.NamespaceAll)),
@@ -157,57 +162,63 @@ func NewController(clientset k8sClient.Clientset, options ...Option) (*Controlle
 		nil,
 	)
 
-	ingressClassManager, err := newIngressClassManager(clientset, ic.queue, opts.MaxRetries)
-	if err != nil {
-		return nil, err
-	}
-	ic.ingressClassManager = ingressClassManager
-
-	serviceManager, err := newServiceManager(clientset, ic.queue, opts.MaxRetries)
-	if err != nil {
-		return nil, err
-	}
-	ic.serviceManager = serviceManager
-
-	endpointManager, err := newEndpointManager(clientset, opts.MaxRetries)
-	if err != nil {
-		return nil, err
-	}
-	ic.endpointManager = endpointManager
-
-	envoyConfigManager, err := newEnvoyConfigManager(clientset, opts.MaxRetries)
-	if err != nil {
-		return nil, err
-	}
-	ic.envoyConfigManager = envoyConfigManager
+	ic.ingressClassManager = newIngressClassManager(ic.queue, ingressClasses)
+	ic.serviceManager = newServiceManager(clientset, ic.queue, opts.MaxRetries)
+	ic.endpointManager = newEndpointManager(clientset, opts.MaxRetries)
+	ic.envoyConfigManager = newEnvoyConfigManager(clientset, opts.MaxRetries)
 
 	ic.secretManager = newNoOpsSecretManager()
 	if ic.enabledSecretsSync {
-		secretManager, err := newSyncSecretsManager(clientset, opts.SecretsNamespace, opts.MaxRetries, ic.defaultSecretNamespace, ic.defaultSecretName)
-		if err != nil {
-			return nil, err
-		}
-		ic.secretManager = secretManager
+		ic.secretManager = newSyncSecretsManager(clientset, opts.SecretsNamespace, opts.MaxRetries, ic.defaultSecretNamespace, ic.defaultSecretName)
 	}
 	ic.sharedLBStatus = ic.retrieveSharedLBServiceStatus()
 
 	return ic, nil
 }
 
-// Run kicks off the controlled loop
-func (ic *Controller) Run() {
+// Run starts the informers and kicks off the controlled loop
+func (ic *Controller) Run(ctx context.Context) error {
 	defer ic.queue.ShutDown()
-	go ic.ingressInformer.Run(wait.NeverStop)
-	if !cache.WaitForCacheSync(wait.NeverStop, ic.ingressInformer.HasSynced) {
-		return
+
+	go ic.serviceManager.informer.Run(wait.NeverStop)
+	if !cache.WaitForCacheSync(wait.NeverStop, ic.serviceManager.informer.HasSynced) {
+		return fmt.Errorf("unable to sync service")
+	}
+	log.WithField("existing-services", ic.serviceManager.store.ListKeys()).Debug("services synced")
+
+	go ic.endpointManager.informer.Run(wait.NeverStop)
+	if !cache.WaitForCacheSync(wait.NeverStop, ic.endpointManager.informer.HasSynced) {
+		return fmt.Errorf("unable to sync ingress endpoint")
 	}
 
-	go ic.ingressClassManager.Run()
+	go ic.envoyConfigManager.informer.Run(wait.NeverStop)
+	if !cache.WaitForCacheSync(wait.NeverStop, ic.envoyConfigManager.informer.HasSynced) {
+		return fmt.Errorf("unable to sync envoy configs")
+	}
+
+	go ic.secretManager.RunInformer(wait.NeverStop)
+	if !ic.secretManager.WaitForCacheSync() {
+		return fmt.Errorf("unable to sync secrets")
+	}
+
+	go ic.ingressClassManager.Run(ctx)
+	// This should only return an error if the context is canceled.
+	if err := ic.ingressClassManager.WaitForSync(ctx); err != nil {
+		return err
+	}
+
+	go ic.ingressInformer.Run(wait.NeverStop)
+	if !cache.WaitForCacheSync(wait.NeverStop, ic.ingressInformer.HasSynced) {
+		return fmt.Errorf("unable to wait for Ingress cache sync")
+	}
+
 	go ic.serviceManager.Run()
 	go ic.secretManager.Run()
 
 	for ic.processEvent() {
 	}
+
+	return nil
 }
 
 func (ic *Controller) processEvent() bool {
@@ -246,7 +257,7 @@ func hasEmptyIngressClass(ingress *slim_networkingv1.Ingress) bool {
 func (ic *Controller) isCiliumIngressEntry(ingress *slim_networkingv1.Ingress) bool {
 	className := getIngressClassName(ingress)
 
-	if (className == nil || *className == "") && ic.isDefaultIngressClass {
+	if (className == nil || *className == "") && ic.ingressClassManager.IsDefault() {
 		return true
 	}
 
@@ -270,38 +281,43 @@ func (ic *Controller) handleIngressAddedEvent(event ingressAddedEvent) error {
 }
 
 func (ic *Controller) handleIngressUpdatedEvent(event ingressUpdatedEvent) error {
-	if !ic.isCiliumIngressEntry(event.newIngress) {
+	oldIngressClassCilium := ic.isCiliumIngressEntry(event.oldIngress)
+	newIngressClassCilium := ic.isCiliumIngressEntry(event.newIngress)
+
+	oldLBModeDedicated := ic.isEffectiveLoadbalancerModeDedicated(event.oldIngress)
+	newLBModeDedicated := ic.isEffectiveLoadbalancerModeDedicated(event.newIngress)
+
+	if !oldIngressClassCilium && !newIngressClassCilium {
 		return nil
 	}
+
 	ic.secretManager.Add(event)
 
-	// Perform clean up if there is change in LB mode
-	oldLBMode := ic.isEffectiveLoadbalancerModeDedicated(event.oldIngress)
-	newLBMode := ic.isEffectiveLoadbalancerModeDedicated(event.newIngress)
+	// Cleanup
 
-	// If the ingress is being switched from dedicated to shared, we need to
-	// clean up the dedicated resources (service, endpoints, envoy config)
-	if oldLBMode && !newLBMode {
+	if oldLBModeDedicated && (!newLBModeDedicated || (oldIngressClassCilium && !newIngressClassCilium)) {
+		// Delete dedicated resources (service, endpoints, CEC)
+		// - if ingress class changed from "cilium" to something else
+		// - if the ingress mode is being switched from dedicated to shared
 		if err := ic.deleteResources(event.oldIngress); err != nil {
 			log.WithError(err).Warn("Failed to delete resources for ingress")
 			return err
 		}
-	}
-
-	// If the ingress is being switched from shared to dedicated, we need to update
-	// shared CiliumEnvoyConfig.
-	if !oldLBMode && newLBMode {
-		err := ic.ensureResources(event.newIngress, true)
-		if err != nil {
+	} else if !oldLBModeDedicated && (newLBModeDedicated || (oldIngressClassCilium && !newIngressClassCilium)) {
+		// Update shared CiliumEnvoyConfig
+		// - if ingress class changed from "cilium" to something else
+		// - if the ingress mode is being switched from shared to dedicated
+		if err := ic.ensureResources(event.newIngress, true); err != nil {
 			return err
 		}
 	}
 
-	err := ic.ensureResources(event.newIngress, false)
-	if err != nil {
-		return err
+	if !newIngressClassCilium {
+		// skip further processing for non Cilium Ingresses
+		return nil
 	}
-	return nil
+
+	return ic.ensureResources(event.newIngress, false)
 }
 
 func (ic *Controller) handleIngressDeletedEvent(event ingressDeletedEvent) error {
@@ -354,40 +370,30 @@ func (ic *Controller) handleIngressServiceUpdatedEvent(ingressServiceUpdated ing
 }
 
 func (ic *Controller) handleCiliumIngressClassUpdatedEvent(event ciliumIngressClassUpdatedEvent) error {
-	log.Debugf("Cilium IngressClass updated")
-	previousValue := ic.isDefaultIngressClass
-	if val, ok := event.ingressClass.GetAnnotations()[slim_networkingv1.AnnotationIsDefaultIngressClass]; ok {
-		isDefault, err := strconv.ParseBool(val)
-		if err != nil {
-			log.WithError(err).Warnf("Failed to parse annotation value for %q", slim_networkingv1.AnnotationIsDefaultIngressClass)
-			return err
-		}
-		ic.isDefaultIngressClass = isDefault
-	} else {
-		// if the annotation is not set we are not the default ingress class
-		ic.isDefaultIngressClass = false
+	if !event.changed {
+		return nil
 	}
 
-	if previousValue != ic.isDefaultIngressClass {
-		log.Debugf("Cilium IngressClass default value changed, re-syncing ingresses")
-		// ensure that all ingresses are in the correct state
-		for _, k := range ic.ingressStore.ListKeys() {
-			ing, err := ic.getByKey(k)
-			if err != nil {
+	log.WithField(CiliumIngressClassIsDefault, event.isDefault).Info(
+		"Cilium IngressClass default value changed, re-syncing ingresses",
+	)
+	// ensure that all ingresses are in the correct state
+	for _, k := range ic.ingressStore.ListKeys() {
+		ing, err := ic.getByKey(k)
+		if err != nil {
+			return err
+		}
+
+		if ic.isCiliumIngressEntry(ing) {
+			// make sure that the ingress is in the correct state
+			if err := ic.ensureResources(ing, false); err != nil {
 				return err
 			}
-
-			if ic.isCiliumIngressEntry(ing) {
-				// make sure that the ingress is in the correct state
-				if err := ic.ensureResources(ing, false); err != nil {
-					return err
-				}
-			} else if hasEmptyIngressClass(ing) && !ic.isDefaultIngressClass {
-				// if we are no longer the default ingress class, we need to clean up
-				// the resources that we created for the ingress
-				if err := ic.deleteResources(ing); err != nil {
-					return err
-				}
+		} else if hasEmptyIngressClass(ing) && !event.isDefault {
+			// if we are no longer the default ingress class, we need to clean up
+			// the resources that we created for the ingress
+			if err := ic.deleteResources(ing); err != nil {
+				return err
 			}
 		}
 	}
@@ -396,28 +402,27 @@ func (ic *Controller) handleCiliumIngressClassUpdatedEvent(event ciliumIngressCl
 }
 
 func (ic *Controller) handleCiliumIngressClassDeletedEvent(event ciliumIngressClassDeletedEvent) error {
-	log.Debug("Cilium IngressClass deleted")
+	if !event.wasDefault {
+		return nil
+	}
 
-	if ic.isDefaultIngressClass {
-		// if we were the default ingress class, we need to clean up all ingresses
-		for _, k := range ic.ingressStore.ListKeys() {
-			ing, err := ic.getByKey(k)
-			if err != nil {
-				return err
-			}
-
-			if hasEmptyIngressClass(ing) {
-				// if we are no longer the default ingress class, we need to clean up
-				// the resources that we created for the ingress
-				if err := ic.deleteResources(ing); err != nil {
-					return err
-				}
-			}
+	log.Debug("Cilium IngressClass deleted, performing cleanup")
+	// if we were the default ingress class, we need to clean up all ingresses
+	for _, k := range ic.ingressStore.ListKeys() {
+		ing, err := ic.getByKey(k)
+		if err != nil {
+			return err
 		}
 
-		// disable the default ingress class behavior
-		ic.isDefaultIngressClass = false
+		if hasEmptyIngressClass(ing) {
+			// if we are no longer the default ingress class, we need to clean up
+			// the resources that we created for the ingress
+			if err := ic.deleteResources(ing); err != nil {
+				return err
+			}
+		}
 	}
+
 	return nil
 }
 
@@ -481,6 +486,7 @@ func getIngressForStatusUpdate(slimIngress *slim_networkingv1.Ingress, lb slim_c
 			UID:             slimIngressCopy.GetUID(),
 			Labels:          slimIngressCopy.GetLabels(),
 			Annotations:     slimIngressCopy.GetAnnotations(),
+			OwnerReferences: slimIngressCopy.GetOwnerReferences(),
 		},
 		Status: networkingv1.IngressStatus{
 			LoadBalancer: networkingv1.IngressLoadBalancerStatus{
@@ -506,10 +512,10 @@ func (ic *Controller) handleEvent(event interface{}) error {
 		log.WithField(logfields.ServiceKey, ev.ingressService.Name).WithField(logfields.K8sNamespace, ev.ingressService.Namespace).Debug("Handling ingress service updated event")
 		err = ic.handleIngressServiceUpdatedEvent(ev)
 	case ciliumIngressClassUpdatedEvent:
-		log.WithField(logfields.IngressClass, ev.ingressClass.Name).Debug("Handling cilium ingress class updated event")
+		log.Debug("Handling cilium ingress class updated event")
 		err = ic.handleCiliumIngressClassUpdatedEvent(ev)
 	case ciliumIngressClassDeletedEvent:
-		log.WithField(logfields.IngressClass, ev.ingressClass.Name).Debug("Handling cilium ingress class deleted event")
+		log.Debug("Handling cilium ingress class deleted event")
 		err = ic.handleCiliumIngressClassDeletedEvent(ev)
 	default:
 		err = fmt.Errorf("received an unknown event: %t", ev)
@@ -588,30 +594,43 @@ func (ic *Controller) regenerate(ing *slim_networkingv1.Ingress, forceShared boo
 		logfields.Ingress:      ing.GetName(),
 	})
 
+	// Used for logging the effective LB mode for this Ingress.
+	var loadbalancerMode string = "shared"
+
 	var translator translation.Translator
 	m := &model.Model{}
 	if !forceShared && ic.isEffectiveLoadbalancerModeDedicated(ing) {
+		loadbalancerMode = "dedicated"
 		translator = ic.dedicatedTranslator
-		m.HTTP = ingestion.Ingress(*ing, ic.defaultSecretNamespace, ic.defaultSecretName)
+		if annotations.GetAnnotationTLSPassthroughEnabled(ing) {
+			m.TLS = append(m.TLS, ingestion.IngressPassthrough(*ing, ic.defaultSecretNamespace, ic.defaultSecretName)...)
+		} else {
+			m.HTTP = append(m.HTTP, ingestion.Ingress(*ing, ic.defaultSecretNamespace, ic.defaultSecretName)...)
+		}
+
 	} else {
 		translator = ic.sharedTranslator
 		for _, k := range ic.ingressStore.ListKeys() {
 			item, _ := ic.getByKey(k)
-			if !ic.isCiliumIngressEntry(item) || ic.isEffectiveLoadbalancerModeDedicated(item) ||
-				ing.GetDeletionTimestamp() != nil {
+			if !ic.isCiliumIngressEntry(item) || ic.isEffectiveLoadbalancerModeDedicated(item) || ing.GetDeletionTimestamp() != nil {
 				continue
 			}
-			m.HTTP = append(m.HTTP, ingestion.Ingress(*item, ic.defaultSecretNamespace, ic.defaultSecretName)...)
+			if annotations.GetAnnotationTLSPassthroughEnabled(item) {
+				m.TLS = append(m.TLS, ingestion.IngressPassthrough(*item, ic.defaultSecretNamespace, ic.defaultSecretName)...)
+			} else {
+				m.HTTP = append(m.HTTP, ingestion.Ingress(*item, ic.defaultSecretNamespace, ic.defaultSecretName)...)
+			}
 		}
 	}
 
 	scopedLog.WithFields(logrus.Fields{
 		"forcedShared": forceShared,
 		"model":        m,
+		"loadbalancer": loadbalancerMode,
 	}).Debug("Generated model for ingress")
 	cec, svc, ep, err := translator.Translate(m)
-	// Propagate Ingress annotation if required. This is applicable only for dedicated LB mode.
-	// For shared LB mode, the service annotation is defined in other higher level (e.g. helm).
+	// Propagate Ingress annotation and label if required. This is applicable only for dedicated LB mode.
+	// For shared LB mode, the service annotation and label are defined in other higher level (e.g. helm).
 	if svc != nil {
 		for key, value := range ing.GetAnnotations() {
 			for _, prefix := range ic.lbAnnotationPrefixes {
@@ -623,11 +642,23 @@ func (ic *Controller) regenerate(ing *slim_networkingv1.Ingress, forceShared boo
 				}
 			}
 		}
+		// Same lbAnnotationPrefixes config option is used for label propagation
+		for key, value := range ing.GetLabels() {
+			for _, prefix := range ic.lbAnnotationPrefixes {
+				if strings.HasPrefix(key, prefix) {
+					if svc.Labels == nil {
+						svc.Labels = make(map[string]string)
+					}
+					svc.Labels[key] = value
+				}
+			}
+		}
 	}
 	scopedLog.WithFields(logrus.Fields{
 		"ciliumEnvoyConfig": cec,
 		"service":           svc,
 		logfields.Endpoint:  ep,
+		"loadbalancer":      loadbalancerMode,
 	}).Debugf("Translated resources for ingress")
 	return cec, svc, ep, err
 }
@@ -654,6 +685,10 @@ func (ic *Controller) isEffectiveLoadbalancerModeDedicated(ing *slim_networkingv
 }
 
 func (ic *Controller) garbageCollectOwnedResources(ing *slim_networkingv1.Ingress) error {
+	// When the Ingress is in shared mode, shared resources cannot be deleted.
+	if !ic.isEffectiveLoadbalancerModeDedicated(ing) {
+		return nil
+	}
 	cec, svc, ep, err := ic.regenerate(ing, false)
 	if err != nil {
 		return err
@@ -678,7 +713,6 @@ func (ic *Controller) garbageCollectOwnedResources(ing *slim_networkingv1.Ingres
 	}
 
 	return nil
-
 }
 
 // deleteObjectIfExists checks the caches to see if the object exists and if so, deletes it. It uses caches as to limit API server requests for objects may have never existed.

@@ -33,6 +33,7 @@ Dinan
 Dockerfile
 Dockerfiles
 Donenfeld
+ENI
 FIt
 Fastabend
 Fosdem
@@ -116,6 +117,7 @@ Vagrantfile
 Vagrantfiles
 Viljoen
 Wendlandt
+Wireguard
 Wireshark
 Xenial
 Yan
@@ -124,6 +126,7 @@ Zannoni
 Zhou
 aarch
 alibabacloud
+allocatable
 allocateLoadBalancerNodePorts
 allocator
 allocators
@@ -132,6 +135,7 @@ allowlist
 amd
 ansible
 api
+apiKey
 apiKeys
 apiserver
 arithmetics
@@ -217,6 +221,7 @@ configSources
 configmap
 configs
 conntrack
+conntrackGCInterval
 containerd
 contrib
 coord
@@ -241,6 +246,7 @@ datapath
 datastore
 datastream
 datastreams
+dbg
 de
 deathstar
 debuginfo
@@ -295,6 +301,7 @@ failover
 filesystem
 filesystems
 firewalling
+fortio
 fqdn
 fromCIDR
 fromCIDRSet
@@ -311,10 +318,12 @@ getpeername
 gettingstarted
 github
 gke
+glibc
 gluecon
 gobpf
 golang
 gops
+goroutine
 goroutines
 grafana
 graphviz
@@ -326,6 +335,7 @@ hashtable
 hashtables
 healthcheck
 healthz
+helloworld
 herokuapp
 hexData
 hostPath
@@ -345,6 +355,7 @@ hugepages
 hv
 icmp
 ie
+ifindex
 impactful
 ingressing
 init
@@ -378,6 +389,7 @@ jitter
 jle
 jlt
 jne
+jobLabel
 jq
 js
 jset
@@ -524,6 +536,8 @@ pluggable
 pmdabcc
 png
 podCIDR
+podippool
+policyCIDRMatchMode
 policymap
 poller
 portmap
@@ -581,6 +595,7 @@ rn
 roadmap
 rollout
 routable
+routingMode
 rst
 runnable
 runtimes
@@ -660,9 +675,12 @@ toGroups
 tofqdns
 tolerations
 toolchain
+traceparent
 tracepoint
 tracepoints
+tracestate
 transpiling
+tunnelProtocol
 ubuntu
 udp
 ui
@@ -686,6 +704,8 @@ uprobes
 uptime
 uretprobes
 url
+urlQuery
+userInfo
 userspace
 uuid
 vCPU
@@ -710,6 +730,8 @@ webhook
 webhooks
 webservice
 whitespace
+wildcarded
+workqueue
 www
 xDS
 xdp

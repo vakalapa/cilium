@@ -166,7 +166,7 @@ To replace cilium-ipsec-keys secret with a new key:
 
 .. code-block:: shell-session
 
-    KEYID=$(kubectl get secret -n kube-system cilium-ipsec-keys -o yaml | awk '/^\s*keys:/ {print $2}' | base64 -d | awk '{print $1}')
+    KEYID=$(kubectl get secret -n kube-system cilium-ipsec-keys -o go-template --template={{.data.keys}} | base64 -d | cut -c 1)
     if [[ $KEYID -ge 15 ]]; then KEYID=0; fi
     data=$(echo "{\"stringData\":{\"keys\":\"$((($KEYID+1))) "rfc4106\(gcm\(aes\)\)" $(echo $(dd if=/dev/urandom count=20 bs=1 2> /dev/null| xxd -p -c 64)) 128\"}}")
     kubectl patch secret -n kube-system cilium-ipsec-keys -p="${data}" -v=1
@@ -182,6 +182,11 @@ included and should be monotonically increasing every re-key with a rollover
 from 15 to 1. The Cilium agent will default to ``KEYID`` of zero if its not
 specified in the secret.
 
+If you are using Cluster Mesh, you must apply the key rotation procedure
+to all clusters in the mesh. You might need to increase the transition time to
+allow for the new keys to be deployed and applied across all clusters,
+which you can do with the agent flag ``ipsec-key-rotation-duration``.
+
 Troubleshooting
 ===============
 
@@ -194,12 +199,13 @@ Troubleshooting
      use ``--set encryption.ipsec.interface=ethX`` to set the encryption
      interface.
 
- * Run ``cilium encrypt status`` in the Cilium Pod:
+ * Run ``cilium-dbg encrypt status`` in the Cilium Pod:
 
    .. code-block:: shell-session
 
-       $ cilium encrypt status
+       $ cilium-dbg encrypt status
        Encryption: IPsec
+       Decryption interface(s): eth0, eth1, eth2
        Keys in use: 1
        Max Seq. Number: 0x1e3/0xffffffff
        Errors: 0
@@ -207,7 +213,9 @@ Troubleshooting
    If the error counter is non-zero, additional information will be displayed
    with the specific errors the kernel encountered. If the sequence number
    reaches its maximum value, it will also result in errors. The number of
-   keys in use should be 2 during a key rotation and always 1 otherwise.
+   keys in use should be 2 during a key rotation and always 1 otherwise. The
+   list of decryption interfaces should have all native devices that may
+   receive pod traffic (for example, ENI interfaces).
 
  * All XFRM errors correspond to a packet drop in the kernel. Except for
    ``XfrmFwdHdrError`` and ``XfrmInError``, all XFRM errors indicate a bug in
@@ -227,7 +235,7 @@ Troubleshooting
    updates and update their configuration within 1 minute after the key is
    changed, leaving plenty of time before the old key is removed. If you expect
    the key rotation to take longer for some reason (for example, in the case of
-   Cluster Mesh if several clusters need to be updated), you can increase the
+   Cluster Mesh where several clusters need to be updated), you can increase the
    delay before cleanup with agent flag ``ipsec-key-rotation-duration``.
 
  * ``XfrmInStateProtoError`` errors can happen if the key is updated without

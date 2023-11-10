@@ -290,8 +290,7 @@ struct endpoint_key {
 	};
 	__u8 family;
 	__u8 key;
-	__u8 cluster_id;
-	__u8 pad;
+	__u16 cluster_id;
 } __packed;
 
 struct tunnel_key {
@@ -305,8 +304,8 @@ struct tunnel_key {
 		union v6addr	ip6;
 	};
 	__u8 family;
-	__u8 cluster_id;
-	__u16 pad;
+	__u8 pad;
+	__u16 cluster_id;
 } __packed;
 
 struct tunnel_value {
@@ -721,9 +720,12 @@ enum metric_dir {
  */
 #define MARK_MAGIC_HEALTH		MARK_MAGIC_DECRYPT
 
-/* Shouldn't interfere with MARK_MAGIC_TO_PROXY. Lower 8bits carries cluster_id */
+/* MARK_MAGIC_CLUSTER_ID shouldn't interfere with MARK_MAGIC_TO_PROXY. Lower
+ * 8bits carries cluster_id, and when extended via the 'max-connected-clusters'
+ * option, the upper 16bits may also be used for cluster_id, starting at the
+ * most significant bit.
+ */
 #define MARK_MAGIC_CLUSTER_ID		MARK_MAGIC_TO_PROXY
-#define MARK_MAGIC_CLUSTER_ID_MASK	0x00FF
 
 /* IPv4 option used to carry service addr and port for DSR.
  *
@@ -792,7 +794,6 @@ enum {
 #define	CB_PORT			CB_SRC_LABEL	/* Alias, non-overlapping */
 #define	CB_HINT			CB_SRC_LABEL	/* Alias, non-overlapping */
 #define	CB_PROXY_MAGIC		CB_SRC_LABEL	/* Alias, non-overlapping */
-#define	CB_ENCRYPT_MAGIC	CB_SRC_LABEL	/* Alias, non-overlapping */
 #define	CB_DST_ENDPOINT_ID	CB_SRC_LABEL    /* Alias, non-overlapping */
 #define CB_SRV6_SID_1		CB_SRC_LABEL	/* Alias, non-overlapping */
 	CB_IFINDEX,
@@ -809,11 +810,11 @@ enum {
 #define	CB_CLUSTER_ID_INGRESS	CB_POLICY	/* Alias, non-overlapping */
 #define CB_HSIPC_PORT		CB_POLICY	/* Alias, non-overlapping */
 #define CB_DSR_SRC_LABEL	CB_POLICY	/* Alias, non-overlapping */
-	CB_NAT,
-#define	CB_ADDR_V6_3		CB_NAT		/* Alias, non-overlapping */
-#define	CB_FROM_HOST		CB_NAT		/* Alias, non-overlapping */
-#define CB_SRV6_SID_4		CB_NAT		/* Alias, non-overlapping */
-#define CB_DSR_L3_OFF		CB_NAT		/* Alias, non-overlapping */
+	CB_3,
+#define	CB_ADDR_V6_3		CB_3		/* Alias, non-overlapping */
+#define	CB_FROM_HOST		CB_3		/* Alias, non-overlapping */
+#define CB_SRV6_SID_4		CB_3		/* Alias, non-overlapping */
+#define CB_DSR_L3_OFF		CB_3		/* Alias, non-overlapping */
 	CB_CT_STATE,
 #define	CB_ADDR_V6_4		CB_CT_STATE	/* Alias, non-overlapping */
 #define	CB_ENCRYPT_IDENTITY	CB_CT_STATE	/* Alias, non-overlapping,
@@ -934,7 +935,7 @@ struct ct_entry {
 	__u32 lifetime;
 	__u16 rx_closing:1,
 	      tx_closing:1,
-	      nat46:1,
+	      unused_nat46:1,	/* unused since v1.12 / 81dee05e82fb */
 	      lb_loopback:1,
 	      seen_non_syn:1,
 	      node_port:1,
@@ -947,6 +948,7 @@ struct ct_entry {
 	__u16 rev_nat_index;
 	/* In the kernel ifindex is u32, so we need to check in cilium-agent
 	 * that ifindex of a NodePort device is <= MAX(u16).
+	 * Unused when HAVE_FIB_INDEX is available.
 	 */
 	__u16 ifindex;
 
@@ -994,11 +996,11 @@ struct lb6_backend {
 	__be16 port;
 	__u8 proto;
 	__u8 flags;
-	__u8 cluster_id;	/* With this field, we can distinguish two
+	__u16 cluster_id;	/* With this field, we can distinguish two
 				 * backends that have the same IP address,
 				 * but belong to the different cluster.
 				 */
-	__u8 pad[3];
+	__u8 pad[2];
 };
 
 struct lb6_health {
@@ -1053,11 +1055,11 @@ struct lb4_backend {
 	__be16 port;		/* L4 port filter */
 	__u8 proto;		/* L4 protocol, currently not used (set to 0) */
 	__u8 flags;
-	__u8 cluster_id;	/* With this field, we can distinguish two
+	__u16 cluster_id;	/* With this field, we can distinguish two
 				 * backends that have the same IP address,
 				 * but belong to the different cluster.
 				 */
-	__u8 pad[3];
+	__u8 pad[2];
 };
 
 struct lb4_health {
@@ -1137,10 +1139,6 @@ struct ct_state {
 	      reserved1:1,	/* Was auth_required, not used in production anywhere */
 	      from_tunnel:1,	/* Connection is from tunnel */
 	      reserved:8;
-#ifndef DISABLE_LOOPBACK_LB
-	__be32 addr;
-	__be32 svc_addr;
-#endif
 	__u32 src_sec_id;
 #ifndef HAVE_FIB_IFINDEX
 	__u16 ifindex;
@@ -1176,7 +1174,8 @@ struct lb6_src_range_key {
 
 static __always_inline int redirect_ep(struct __ctx_buff *ctx __maybe_unused,
 				       int ifindex __maybe_unused,
-				       bool needs_backlog __maybe_unused)
+				       bool needs_backlog __maybe_unused,
+				       bool from_tunnel)
 {
 	/* Going via CPU backlog queue (aka needs_backlog) is required
 	 * whenever we cannot do a fast ingress -> ingress switch but
@@ -1185,15 +1184,15 @@ static __always_inline int redirect_ep(struct __ctx_buff *ctx __maybe_unused,
 	 */
 	if (needs_backlog || !is_defined(ENABLE_HOST_ROUTING)) {
 		return ctx_redirect(ctx, ifindex, 0);
-	} else {
-# ifdef HAVE_ENCAP
-		/* When coming from overlay, we need to set packet type
-		 * to HOST as otherwise we might get dropped in IP layer.
-		 */
-		ctx_change_type(ctx, PACKET_HOST);
-# endif /* HAVE_ENCAP */
-		return ctx_redirect_peer(ctx, ifindex, 0);
 	}
+
+	/* When coming from overlay, we need to set packet type
+	 * to HOST as otherwise we might get dropped in IP layer.
+	 */
+	if (from_tunnel)
+		ctx_change_type(ctx, PACKET_HOST);
+
+	return ctx_redirect_peer(ctx, ifindex, 0);
 }
 
 static __always_inline __u64 ctx_adjust_hroom_flags(void)

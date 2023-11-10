@@ -48,6 +48,8 @@ type CachingIdentityAllocator struct {
 
 	localIdentities *localIdentityCache
 
+	localNodeIdentities *localIdentityCache
+
 	identitiesPath string
 
 	// This field exists is to hand out references that are either for sending
@@ -133,6 +135,15 @@ type IdentityAllocator interface {
 	// ReleaseCIDRIdentitiesByID() is a wrapper for ReleaseSlice() that
 	// also handles ipcache entries.
 	ReleaseCIDRIdentitiesByID(context.Context, []identity.NumericIdentity)
+
+	// WithholdLocalIdentities holds a set of numeric identities out of the local
+	// allocation pool(s). Once withheld, a numeric identity can only be used
+	// when explicitly requested via AllocateIdentity(..., oldNID).
+	WithholdLocalIdentities(nids []identity.NumericIdentity)
+
+	// UnwithholdLocalIdentities removes numeric identities from the withheld set,
+	// freeing them for general allocation.
+	UnwithholdLocalIdentities(nids []identity.NumericIdentity)
 }
 
 // InitIdentityAllocator creates the global identity allocator. Only the first
@@ -155,8 +166,8 @@ func (m *CachingIdentityAllocator) InitIdentityAllocator(client clientset.Interf
 
 	log.Info("Initializing identity allocator")
 
-	minID := idpool.ID(identity.MinimalAllocationIdentity)
-	maxID := idpool.ID(identity.MaximumAllocationIdentity)
+	minID := idpool.ID(identity.GetMinimalAllocationIdentity())
+	maxID := idpool.ID(identity.GetMaximumAllocationIdentity())
 
 	log.WithFields(map[string]interface{}{
 		"min":        minID,
@@ -209,7 +220,7 @@ func (m *CachingIdentityAllocator) InitIdentityAllocator(client clientset.Interf
 			allocator.WithMax(maxID), allocator.WithMin(minID),
 			allocator.WithEvents(events),
 			allocator.WithMasterKeyProtection(),
-			allocator.WithPrefixMask(idpool.ID(option.Config.ClusterID<<identity.ClusterIDShift)))
+			allocator.WithPrefixMask(idpool.ID(option.Config.ClusterID<<identity.GetClusterIDShift())))
 		if err != nil {
 			log.WithError(err).Fatalf("Unable to initialize Identity Allocator with backend %s", option.Config.IdentityAllocationMode)
 		}
@@ -253,7 +264,8 @@ func NewCachingIdentityAllocator(owner IdentityAllocatorOwner) *CachingIdentityA
 
 	// Local identity cache can be created synchronously since it doesn't
 	// rely upon any external resources (e.g., external kvstore).
-	m.localIdentities = newLocalIdentityCache(identity.MinAllocatorLocalIdentity, identity.MaxAllocatorLocalIdentity, m.events)
+	m.localIdentities = newLocalIdentityCache(identity.IdentityScopeLocal, identity.MinAllocatorLocalIdentity, identity.MaxAllocatorLocalIdentity, m.events)
+	m.localNodeIdentities = newLocalIdentityCache(identity.IdentityScopeRemoteNode, identity.MinAllocatorLocalIdentity, identity.MaxAllocatorLocalIdentity, m.events)
 
 	return m
 }
@@ -275,9 +287,9 @@ func (m *CachingIdentityAllocator) Close() {
 
 	m.IdentityAllocator.Delete()
 	if m.events != nil {
-		// Have the now only remaining writing party close the events channel,
-		// to ensure we don't panic with 'send on closed channel'.
 		m.localIdentities.close()
+		m.localNodeIdentities.close()
+		close(m.events)
 		m.events = nil
 	}
 
@@ -315,6 +327,8 @@ func (m *CachingIdentityAllocator) AllocateIdentity(ctx context.Context, lbls la
 			if allocated || isNewLocally {
 				if id.ID.HasLocalScope() {
 					metrics.Identity.WithLabelValues(identity.NodeLocalIdentityType).Inc()
+				} else if id.ID.HasRemoteNodeScope() {
+					metrics.Identity.WithLabelValues(identity.RemoteNodeIdentityType).Inc()
 				} else if id.ID.IsReservedIdentity() {
 					metrics.Identity.WithLabelValues(identity.ReservedIdentityType).Inc()
 				} else {
@@ -349,8 +363,13 @@ func (m *CachingIdentityAllocator) AllocateIdentity(ctx context.Context, lbls la
 		return reservedIdentity, false, nil
 	}
 
-	if !identity.RequiresGlobalIdentity(lbls) {
+	// If the set of labels uses non-global scope,
+	// then allocate with the appropriate local allocator and return.
+	switch identity.ScopeForLabels(lbls) {
+	case identity.IdentityScopeLocal:
 		return m.localIdentities.lookupOrCreate(lbls, oldNID)
+	case identity.IdentityScopeRemoteNode:
+		return m.localNodeIdentities.lookupOrCreate(lbls, oldNID)
 	}
 
 	// This will block until the kvstore can be accessed and all identities
@@ -384,6 +403,25 @@ func (m *CachingIdentityAllocator) AllocateIdentity(ctx context.Context, lbls la
 	return identity.NewIdentity(identity.NumericIdentity(idp), lbls), isNew, nil
 }
 
+func (m *CachingIdentityAllocator) WithholdLocalIdentities(nids []identity.NumericIdentity) {
+	log.WithField(logfields.Identity, nids).Debug("Withholding numeric identities for later restoration")
+
+	// The allocators will return any identities that are not in-scope.
+	nids = m.localIdentities.withhold(nids)
+	nids = m.localNodeIdentities.withhold(nids)
+	if len(nids) > 0 {
+		log.WithField(logfields.Identity, nids).Error("Attempt to restore invalid numeric identities.")
+	}
+}
+
+func (m *CachingIdentityAllocator) UnwithholdLocalIdentities(nids []identity.NumericIdentity) {
+	log.WithField(logfields.Identity, nids).Debug("Unwithholding numeric identities")
+
+	// The allocators will ignore any identities that are not in-scope.
+	m.localIdentities.unwithhold(nids)
+	m.localNodeIdentities.unwithhold(nids)
+}
+
 // Release is the reverse operation of AllocateIdentity() and releases the
 // identity again. This function may result in kvstore operations.
 // After the last user has released the ID, the returned lastUse value is true.
@@ -392,6 +430,8 @@ func (m *CachingIdentityAllocator) Release(ctx context.Context, id *identity.Ide
 		if released {
 			if id.ID.HasLocalScope() {
 				metrics.Identity.WithLabelValues(identity.NodeLocalIdentityType).Dec()
+			} else if id.ID.HasRemoteNodeScope() {
+				metrics.Identity.WithLabelValues(identity.RemoteNodeIdentityType).Dec()
 			} else if id.ID.IsReservedIdentity() {
 				metrics.Identity.WithLabelValues(identity.ReservedIdentityType).Dec()
 			} else {
@@ -411,8 +451,11 @@ func (m *CachingIdentityAllocator) Release(ctx context.Context, id *identity.Ide
 		return false, nil
 	}
 
-	if !identity.RequiresGlobalIdentity(id.Labels) {
+	switch identity.ScopeForLabels(id.Labels) {
+	case identity.IdentityScopeLocal:
 		return m.localIdentities.release(id), nil
+	case identity.IdentityScopeRemoteNode:
+		return m.localNodeIdentities.release(id), nil
 	}
 
 	// This will block until the kvstore can be accessed and all identities

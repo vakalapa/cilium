@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"net/netip"
 	"sync"
-	"time"
 
 	"github.com/sirupsen/logrus"
 
@@ -19,6 +18,7 @@ import (
 	endpointid "github.com/cilium/cilium/pkg/endpoint/id"
 	"github.com/cilium/cilium/pkg/endpoint/regeneration"
 	"github.com/cilium/cilium/pkg/endpointmanager/idallocator"
+	"github.com/cilium/cilium/pkg/hive/cell"
 	"github.com/cilium/cilium/pkg/identity/cache"
 	"github.com/cilium/cilium/pkg/ipcache"
 	"github.com/cilium/cilium/pkg/k8s/watchers/subscriber"
@@ -31,6 +31,7 @@ import (
 	"github.com/cilium/cilium/pkg/node"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/policy"
+	"github.com/cilium/cilium/pkg/time"
 )
 
 var (
@@ -48,6 +49,8 @@ var _ subscriber.Node = (*endpointManager)(nil)
 // endpointManager is a structure designed for containing state about the
 // collection of locally running endpoints.
 type endpointManager struct {
+	reporterScope cell.Scope
+
 	// mutex protects endpoints and endpointsAux
 	mutex lock.RWMutex
 
@@ -84,13 +87,8 @@ type endpointManager struct {
 
 	// controllers associated with the endpoint manager.
 	controllers *controller.Manager
-}
 
-// EndpointResourceSynchronizer is an interface which synchronizes CiliumEndpoint
-// resources with Kubernetes.
-type EndpointResourceSynchronizer interface {
-	RunK8sCiliumEndpointSync(ep *endpoint.Endpoint, conf endpoint.EndpointStatusConfiguration)
-	DeleteK8sCiliumEndpointSync(e *endpoint.Endpoint)
+	policyMapPressure *policyMapPressure
 }
 
 // endpointDeleteFunc is used to abstract away concrete Endpoint Delete
@@ -98,8 +96,9 @@ type EndpointResourceSynchronizer interface {
 type endpointDeleteFunc func(*endpoint.Endpoint, endpoint.DeleteConfig) []error
 
 // New creates a new endpointManager.
-func New(epSynchronizer EndpointResourceSynchronizer) *endpointManager {
+func New(epSynchronizer EndpointResourceSynchronizer, reporterScope cell.Scope) *endpointManager {
 	mgr := endpointManager{
+		reporterScope:                reporterScope,
 		endpoints:                    make(map[uint16]*endpoint.Endpoint),
 		endpointsAux:                 make(map[string]*endpoint.Endpoint),
 		mcastManager:                 mcastmanager.New(option.Config.IPv6MCastDevice),
@@ -108,7 +107,7 @@ func New(epSynchronizer EndpointResourceSynchronizer) *endpointManager {
 		controllers:                  controller.NewManager(),
 	}
 	mgr.deleteEndpoint = mgr.removeEndpoint
-
+	mgr.policyMapPressure = newPolicyMapPressure()
 	return &mgr
 }
 
@@ -118,10 +117,11 @@ func (mgr *endpointManager) WithPeriodicEndpointGC(ctx context.Context, checkHea
 	mgr.checkHealth = checkHealth
 	mgr.controllers.UpdateController("endpoint-gc",
 		controller.ControllerParams{
-			Group:       endpointGCControllerGroup,
-			DoFunc:      mgr.markAndSweep,
-			RunInterval: interval,
-			Context:     ctx,
+			Group:          endpointGCControllerGroup,
+			DoFunc:         mgr.markAndSweep,
+			RunInterval:    interval,
+			Context:        ctx,
+			HealthReporter: cell.GetHealthReporter(mgr.reporterScope, "endpoint-gc"),
 		})
 	return mgr
 }
@@ -381,7 +381,9 @@ func (mgr *endpointManager) ReleaseID(ep *endpoint.Endpoint) error {
 // unexpose removes the endpoint from the endpointmanager, so subsequent
 // lookups will no longer find the endpoint.
 func (mgr *endpointManager) unexpose(ep *endpoint.Endpoint) {
+	defer ep.Close()
 	identifiers := ep.Identifiers()
+
 	previousState := ep.GetState()
 
 	mgr.mutex.Lock()
@@ -614,13 +616,15 @@ func (mgr *endpointManager) expose(ep *endpoint.Endpoint) error {
 	mgr.mutex.Lock()
 	// Get a copy of the identifiers before exposing the endpoint
 	identifiers := ep.Identifiers()
+	ep.PolicyMapPressureUpdater = mgr.policyMapPressure
 	ep.Start(newID)
 	mgr.mcastManager.AddAddress(ep.IPv6)
 	mgr.updateIDReferenceLocked(ep)
 	mgr.updateReferencesLocked(ep, identifiers)
 	mgr.mutex.Unlock()
 
-	mgr.RunK8sCiliumEndpointSync(ep, option.Config)
+	ep.InitEndpointScope(mgr.reporterScope)
+	mgr.RunK8sCiliumEndpointSync(ep, option.Config, ep.GetReporter("cep-k8s-sync"))
 
 	return nil
 }
@@ -660,6 +664,29 @@ func (mgr *endpointManager) AddEndpoint(owner regeneration.Owner, ep *endpoint.E
 		s.EndpointCreated(ep)
 	}
 	mgr.mutex.RUnlock()
+
+	return nil
+}
+
+func (mgr *endpointManager) AddIngressEndpoint(
+	ctx context.Context,
+	owner regeneration.Owner,
+	policyGetter policyRepoGetter,
+	ipcache *ipcache.IPCache,
+	proxy endpoint.EndpointProxy,
+	allocator cache.IdentityAllocator,
+	reason string,
+) error {
+	ep, err := endpoint.CreateIngressEndpoint(owner, policyGetter, ipcache, proxy, allocator)
+	if err != nil {
+		return err
+	}
+
+	if err := mgr.AddEndpoint(owner, ep, reason); err != nil {
+		return err
+	}
+
+	ep.InitWithIngressLabels(ctx, launchTime)
 
 	return nil
 }

@@ -7,6 +7,7 @@
 package agent
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -27,6 +28,7 @@ import (
 
 	"github.com/cilium/cilium/api/v1/models"
 	"github.com/cilium/cilium/pkg/cidr"
+	"github.com/cilium/cilium/pkg/clustermesh"
 	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	"github.com/cilium/cilium/pkg/datapath/linux/linux_defaults"
 	"github.com/cilium/cilium/pkg/datapath/linux/route"
@@ -75,7 +77,8 @@ type Agent struct {
 
 	cleanup []func()
 
-	nodeToNodeEncryption bool
+	optOut                 bool
+	requireNodesInPeerList bool
 }
 
 // NewAgent creates a new WireGuard Agent
@@ -109,7 +112,11 @@ func NewAgent(privKeyPath string, localNodeStore *node.LocalNodeStore) (*Agent, 
 
 		cleanup: []func(){},
 
-		nodeToNodeEncryption: option.Config.EncryptNode && !optOut,
+		optOut: optOut,
+		requireNodesInPeerList: (option.Config.EncryptNode && !optOut) ||
+			// Enapsulated pkt is encrypted in tunneling mode. So, outer
+			// src/dst IP (= nodes IP) needs to be in the WG peer list.
+			option.Config.TunnelingEnabled(),
 	}, nil
 }
 
@@ -275,7 +282,13 @@ func (a *Agent) Init(ipcache *ipcache.IPCache, mtuConfig mtu.Configuration) erro
 	return nil
 }
 
-func (a *Agent) RestoreFinished() error {
+func (a *Agent) RestoreFinished(cm *clustermesh.ClusterMesh) error {
+	if cm != nil {
+		// Wait until we received the initial list of nodes from all remote clusters,
+		// otherwise we might remove valid peers and disrupt existing connections.
+		cm.NodesSynced(context.Background())
+	}
+
 	a.Lock()
 	defer a.Unlock()
 
@@ -351,7 +364,7 @@ func (a *Agent) UpdatePeer(nodeName, pubKeyHex string, nodeIPv4, nodeIPv6 net.IP
 		var lookupIPv4, lookupIPv6 net.IP
 		if option.Config.EnableIPv4 && nodeIPv4 != nil {
 			lookupIPv4 = nodeIPv4
-			if a.nodeToNodeEncryption {
+			if a.requireNodesInPeerList {
 				allowedIPs = append(allowedIPs, net.IPNet{
 					IP:   nodeIPv4,
 					Mask: net.CIDRMask(net.IPv4len*8, net.IPv4len*8),
@@ -360,7 +373,7 @@ func (a *Agent) UpdatePeer(nodeName, pubKeyHex string, nodeIPv4, nodeIPv6 net.IP
 		}
 		if option.Config.EnableIPv6 && nodeIPv6 != nil {
 			lookupIPv6 = nodeIPv6
-			if a.nodeToNodeEncryption {
+			if a.requireNodesInPeerList {
 				allowedIPs = append(allowedIPs, net.IPNet{
 					IP:   nodeIPv6,
 					Mask: net.CIDRMask(net.IPv6len*8, net.IPv6len*8),
@@ -465,7 +478,9 @@ func (a *Agent) updatePeerByConfig(p *peerConfig) error {
 		AllowedIPs:        p.allowedIPs,
 		ReplaceAllowedIPs: true,
 	}
-
+	if option.Config.WireguardPersistentKeepalive != 0 {
+		peer.PersistentKeepaliveInterval = &option.Config.WireguardPersistentKeepalive
+	}
 	cfg := wgtypes.Config{
 		ReplacePeers: false,
 		Peers:        []wgtypes.PeerConfig{peer},
@@ -606,7 +621,7 @@ func (a *Agent) Status(withPeers bool) (*models.WireguardStatus, error) {
 
 	var nodeEncryptionStatus = "Disabled"
 	if option.Config.EncryptNode {
-		if !a.nodeToNodeEncryption {
+		if a.optOut {
 			nodeEncryptionStatus = "OptedOut"
 		} else {
 			nodeEncryptionStatus = "Enabled"

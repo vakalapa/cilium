@@ -9,10 +9,12 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	. "github.com/cilium/checkmate"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/exp/maps"
 
@@ -41,10 +43,12 @@ type dummyBackend struct {
 	identities map[idpool.ID]AllocatorKey
 	handler    CacheMutations
 
+	updateKey func(ctx context.Context, id idpool.ID, key AllocatorKey) error
+
 	disableListDone bool
 }
 
-func newDummyBackend() Backend {
+func newDummyBackend() *dummyBackend {
 	return &dummyBackend{
 		identities: map[idpool.ID]AllocatorKey{},
 	}
@@ -60,12 +64,12 @@ func (d *dummyBackend) DeleteAllKeys(ctx context.Context) {
 	d.identities = map[idpool.ID]AllocatorKey{}
 }
 
-func (d *dummyBackend) AllocateID(ctx context.Context, id idpool.ID, key AllocatorKey) error {
+func (d *dummyBackend) AllocateID(ctx context.Context, id idpool.ID, key AllocatorKey) (AllocatorKey, error) {
 	d.mutex.Lock()
 	defer d.mutex.Unlock()
 
 	if _, ok := d.identities[id]; ok {
-		return fmt.Errorf("identity already exists")
+		return nil, fmt.Errorf("identity already exists")
 	}
 
 	d.identities[id] = key
@@ -74,10 +78,10 @@ func (d *dummyBackend) AllocateID(ctx context.Context, id idpool.ID, key Allocat
 		d.handler.OnAdd(id, key)
 	}
 
-	return nil
+	return key, nil
 }
 
-func (d *dummyBackend) AllocateIDIfLocked(ctx context.Context, id idpool.ID, key AllocatorKey, lock kvstore.KVLocker) error {
+func (d *dummyBackend) AllocateIDIfLocked(ctx context.Context, id idpool.ID, key AllocatorKey, lock kvstore.KVLocker) (AllocatorKey, error) {
 	return d.AllocateID(ctx, id, key)
 }
 
@@ -114,6 +118,9 @@ func (d *dummyBackend) UpdateKey(ctx context.Context, id idpool.ID, key Allocato
 	d.mutex.Lock()
 	defer d.mutex.Unlock()
 	d.identities[id] = key
+	if d.updateKey != nil {
+		return d.updateKey(ctx, id, key)
+	}
 	return nil
 }
 
@@ -208,6 +215,14 @@ func (t TestAllocatorKey) PutKeyFromMap(m map[string]string) AllocatorKey {
 	}
 
 	panic("empty map")
+}
+
+func (t TestAllocatorKey) PutValue(key any, value any) AllocatorKey {
+	panic("not implemented")
+}
+
+func (t TestAllocatorKey) Value(any) any {
+	panic("not implemented")
 }
 
 func randomTestName() string {
@@ -404,8 +419,8 @@ func TestObserveAllocatorChanges(t *testing.T) {
 
 	// Simulate changes to the allocations via the backend
 	go func() {
-		backend.(*dummyBackend).handler.OnAdd(idpool.ID(123), TestAllocatorKey("remote"))
-		backend.(*dummyBackend).handler.OnDelete(idpool.ID(123), TestAllocatorKey("remote"))
+		backend.handler.OnAdd(idpool.ID(123), TestAllocatorKey("remote"))
+		backend.handler.OnDelete(idpool.ID(123), TestAllocatorKey("remote"))
 	}()
 
 	// Check that we observe the allocation and the deletions.
@@ -423,100 +438,77 @@ func TestObserveAllocatorChanges(t *testing.T) {
 	require.False(t, notClosed)
 }
 
-// The following tests are currently disabled as they are not 100% reliable in
-// the Jenkins CI.
-// These were copied from pkg/kvstore/allocator/allocator_test.go and don't
-// compile anymore. They assume that dummyBackend can be shared between many
-// allocators in order to test parallel allocations.
-//
-//func testParallelAllocator(c *C, maxID idpool.ID, allocatorName string, suffix string) {
-//	allocator, err := NewAllocator(allocatorName, TestAllocatorKey(""), WithMax(maxID), WithSuffix(suffix))
-//	c.Assert(err, IsNil)
-//	c.Assert(allocator, Not(IsNil))
-//
-//	// allocate all available IDs
-//	for i := idpool.ID(1); i <= maxID; i++ {
-//		key := TestAllocatorKey(fmt.Sprintf("key%04d", i))
-//		id, _, err := allocator.Allocate(context.Background(), key)
-//		c.Assert(err, IsNil)
-//		c.Assert(id, Not(Equals), 0)
-//
-//		// refcnt must be 1
-//		c.Assert(allocator.localKeys.keys[key.GetKey()].refcnt, Equals, uint64(1))
-//	}
-//
-//	saved := allocator.backoffTemplate.Factor
-//	allocator.backoffTemplate.Factor = 1.0
-//
-//	// we should be out of id space here
-//	_, new, err := allocator.Allocate(context.Background(), TestAllocatorKey(fmt.Sprintf("key%04d", maxID+1)))
-//	c.Assert(err, Not(IsNil))
-//	c.Assert(new, Equals, false)
-//
-//	allocator.backoffTemplate.Factor = saved
-//
-//	// allocate all IDs again using the same set of keys, refcnt should go to 2
-//	for i := idpool.ID(1); i <= maxID; i++ {
-//		key := TestAllocatorKey(fmt.Sprintf("key%04d", i))
-//		id, _, err := allocator.Allocate(context.Background(), key)
-//		c.Assert(err, IsNil)
-//		c.Assert(id, Not(Equals), 0)
-//
-//		// refcnt must now be 2
-//		c.Assert(allocator.localKeys.keys[key.GetKey()].refcnt, Equals, uint64(2))
-//	}
-//
-//	for i := idpool.ID(1); i <= maxID; i++ {
-//		allocator.Release(context.Background(), TestAllocatorKey(fmt.Sprintf("key%04d", i)))
-//	}
-//
-//	// release final reference of all IDs
-//	for i := idpool.ID(1); i <= maxID; i++ {
-//		allocator.Release(context.Background(), TestAllocatorKey(fmt.Sprintf("key%04d", i)))
-//	}
-//
-//	// running the GC should evict all entries
-//	allocator.RunGC()
-//
-//	v, err := kvstore.ListPrefix(allocator.idPrefix)
-//	c.Assert(err, IsNil)
-//	c.Assert(len(v), Equals, 0)
-//
-//	allocator.Delete()
-//}
-//
-//func (s *AllocatorSuite) TestParallelAllocation(c *C) {
-//	var (
-//		wg            sync.WaitGroup
-//		allocatorName = randomTestName()
-//	)
-//
-//	// create dummy allocator to delete all keys
-//	a, err := NewAllocator(allocatorName, TestAllocatorKey(""), WithSuffix("a"))
-//	c.Assert(err, IsNil)
-//	c.Assert(a, Not(IsNil))
-//	defer a.DeleteAllKeys()
-//	defer a.Delete()
-//
-//	for i := 0; i < 2; i++ {
-//		wg.Add(1)
-//		go func() {
-//			defer wg.Done()
-//			testParallelAllocator(c, idpool.ID(64), allocatorName, fmt.Sprintf("node-%d", i))
-//		}()
-//	}
-//
-//	wg.Wait()
-//}
+// TestHandleK8sDelete tests the behavior of the allocator of handling OnDelete events
+// when master key protection is enabled vs disabled.
+func TestHandleK8sDelete(t *testing.T) {
+
+	masterKeyRecreateMaxInterval = time.Millisecond
+	backend := newDummyBackend()
+
+	alloc, err := NewAllocator(TestAllocatorKey(""), backend)
+	alloc.idPool = idpool.NewIDPool(1234, 1234)
+	alloc.enableMasterKeyProtection = true
+	require.NoError(t, err)
+
+	_, newlyAllocated, first, err := alloc.Allocate(context.Background(), TestAllocatorKey("foo"))
+	require.NoError(t, err)
+	require.True(t, first)
+	require.True(t, newlyAllocated)
+
+	var counter atomic.Uint32
+	backend.updateKey = func(ctx context.Context, id idpool.ID, key AllocatorKey) error {
+		counter.Add(1)
+		if counter.Load() <= 2 {
+			return fmt.Errorf("updateKey failed: %d", counter.Load())
+		}
+		return nil
+	}
+
+	assertBackendContains := func(t assert.TestingT, id int, key string) {
+		k, err := backend.GetByID(context.TODO(), idpool.ID(id))
+		assert.NoError(t, err)
+		assert.Equal(t, key, k.GetKey())
+	}
+
+	// 1. Simulate a delete event, where master key protection is enabled
+	// and the identity is owned locally.
+	assertBackendContains(t, 1234, "foo")
+
+	alloc.mainCache.OnDelete(1234, TestAllocatorKey("foo"))
+	// Check that the identity was retried multiple times by master key protection.
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		assert.Equal(c, uint32(3), counter.Load())
+	}, time.Second, time.Millisecond)
+
+	assert.Contains(t, alloc.mainCache.nextCache, idpool.ID(1234))
+	assert.Contains(t, alloc.mainCache.nextKeyCache, "foo")
+
+	// 2. Simulate a delete event, where master key protection is disabled.
+	alloc.enableMasterKeyProtection = false
+	alloc.mainCache.OnDelete(1234, TestAllocatorKey("foo"))
+	assert.NotContains(t, alloc.mainCache.nextCache, idpool.ID(1234))
+	assert.NotContains(t, alloc.mainCache.nextKeyCache, "foo")
+
+	// 3. Simulate delete event where master key protection is enabled
+	// but the identity is not owned locally.
+	alloc.enableMasterKeyProtection = true
+	alloc.mainCache.OnAdd(4321, TestAllocatorKey("bar"))
+	assert.Contains(t, alloc.mainCache.nextCache, idpool.ID(4321))
+	assert.Contains(t, alloc.mainCache.nextKeyCache, "bar")
+	alloc.mainCache.OnDelete(idpool.ID(4321), TestAllocatorKey("bar"))
+	assert.NotContains(t, alloc.mainCache.nextCache, idpool.ID(4321))
+	assert.NotContains(t, alloc.mainCache.nextKeyCache, "bar")
+}
 
 func TestWatchRemoteKVStore(t *testing.T) {
 	var wg sync.WaitGroup
+	var synced bool
 
 	run := func(ctx context.Context, rc *RemoteCache) context.CancelFunc {
 		ctx, cancel := context.WithCancel(ctx)
 		wg.Add(1)
 		go func() {
-			rc.Watch(ctx)
+			rc.Watch(ctx, func(context.Context) { synced = true })
 			wg.Done()
 		}()
 		return cancel
@@ -525,6 +517,7 @@ func TestWatchRemoteKVStore(t *testing.T) {
 	stop := func(cancel context.CancelFunc) {
 		cancel()
 		wg.Wait()
+		synced = false
 	}
 
 	global := Allocator{remoteCaches: make(map[string]*RemoteCache)}
@@ -564,6 +557,7 @@ func TestWatchRemoteKVStore(t *testing.T) {
 	}, 1*time.Second, 10*time.Millisecond)
 
 	require.True(t, rc.Synced(), "The cache should now be synchronized")
+	require.True(t, synced, "The on-sync callback should have been executed")
 	stop(cancel)
 	require.False(t, rc.Synced(), "The cache should no longer be synchronized when stopped")
 
@@ -597,7 +591,7 @@ func TestWatchRemoteKVStore(t *testing.T) {
 	// detected as part of the initial list operation, which was not present in
 	// the existing cache.
 	backend = newDummyBackend()
-	backend.(*dummyBackend).disableListDone = true
+	backend.disableListDone = true
 	remote = newRemoteAllocator(backend)
 	backend.AllocateID(ctx, idpool.ID(1), TestAllocatorKey("qux"))
 	backend.AllocateID(ctx, idpool.ID(7), TestAllocatorKey("foo"))
@@ -608,6 +602,7 @@ func TestWatchRemoteKVStore(t *testing.T) {
 	require.Equal(t, AllocatorEvent{ID: idpool.ID(1), Key: TestAllocatorKey("qux"), Typ: kvstore.EventTypeModify}, <-events)
 	require.Equal(t, AllocatorEvent{ID: idpool.ID(7), Key: TestAllocatorKey("foo"), Typ: kvstore.EventTypeModify}, <-events)
 	require.False(t, rc.Synced(), "The cache should not be synchronized if the ListDone event has not been received")
+	require.False(t, synced, "The on-sync callback should not have been executed if the ListDone event has not been received")
 
 	stop(cancel)
 

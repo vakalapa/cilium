@@ -288,7 +288,8 @@ snat_v4_nat_handle_mapping(struct __ctx_buff *ctx,
 
 		ret = ct_lazy_lookup4(get_ct_map4(&tuple_snat), &tuple_snat,
 				      ctx, off, has_l4_header, CT_EGRESS,
-				      SCOPE_FORWARD, &ct_state, &trace->monitor);
+				      SCOPE_FORWARD, CT_ENTRY_ANY,
+				      &ct_state, &trace->monitor);
 		if (ret < 0)
 			return ret;
 
@@ -342,7 +343,8 @@ snat_v4_rev_nat_handle_mapping(struct __ctx_buff *ctx,
 
 		ret = ct_lazy_lookup4(get_ct_map4(&tuple_revsnat), &tuple_revsnat,
 				      ctx, off, has_l4_header, CT_INGRESS,
-				      SCOPE_REVERSE, &ct_state, &trace->monitor);
+				      SCOPE_REVERSE, CT_ENTRY_ANY,
+				      &ct_state, &trace->monitor);
 		if (ret < 0)
 			return ret;
 
@@ -362,6 +364,7 @@ snat_v4_rewrite_headers(struct __ctx_buff *ctx, __u8 nexthdr, int l3_off,
 			__be16 old_port, __be16 new_port, __u16 port_off)
 {
 	__wsum sum;
+	int err;
 
 	/* No change needed: */
 	if (old_addr == new_addr && old_port == new_port)
@@ -374,14 +377,10 @@ snat_v4_rewrite_headers(struct __ctx_buff *ctx, __u8 nexthdr, int l3_off,
 	if (has_l4_header) {
 		int flags = BPF_F_PSEUDO_HDR;
 		struct csum_offset csum = {};
-		__wsum l4_sum = sum;
 
 		csum_l4_offset_and_flags(nexthdr, &csum);
 
 		if (old_port != new_port) {
-			__be32 from = old_port;
-			__be32 to = new_port;
-
 			switch (nexthdr) {
 			case IPPROTO_TCP:
 			case IPPROTO_UDP:
@@ -391,25 +390,34 @@ snat_v4_rewrite_headers(struct __ctx_buff *ctx, __u8 nexthdr, int l3_off,
 				return DROP_CSUM_L4;
 #endif  /* ENABLE_SCTP */
 			case IPPROTO_ICMP:
-				/* Not initialized by csum_l4_offset_and_flags(): */
+				/* Not initialized by csum_l4_offset_and_flags(), because ICMPv4
+				 * doesn't use a pseudo-header, and the change in IP addresses is
+				 * not supposed to change the L4 checksum.
+				 * Set it temporarily to amend the checksum after changing ports.
+				 */
 				csum.offset = offsetof(struct icmphdr, checksum);
-				/* No Pseudo-Hdr checksum for ICMPv4: */
-				flags = 0;
 				break;
 			default:
 				return DROP_UNKNOWN_L4;
 			}
 
-			l4_sum = csum_diff(&from, 4, &to, 4, 0);
-			if (l4_store_port(ctx, l4_off, port_off, new_port) < 0)
-				return DROP_WRITE_ERROR;
+			/* Amend the L4 checksum due to changing the ports. */
+			err = l4_modify_port(ctx, l4_off, port_off, &csum, new_port, old_port);
+			if (err < 0)
+				return err;
+
+			/* Restore the original offset. */
+			if (nexthdr == IPPROTO_ICMP)
+				csum.offset = 0;
 		}
 
+		/* Amend the L4 checksum due to changing the addresses. */
 		if (csum.offset &&
-		    csum_l4_replace(ctx, l4_off, &csum, 0, l4_sum, flags) < 0)
+		    csum_l4_replace(ctx, l4_off, &csum, 0, sum, flags) < 0)
 			return DROP_CSUM_L4;
 	}
 
+	/* Amend the L3 checksum due to changing the addresses. */
 	if (ipv4_csum_update_by_diff(ctx, l3_off, sum) < 0)
 		return DROP_CSUM_L3;
 
@@ -693,7 +701,7 @@ snat_v4_needs_masquerade(struct __ctx_buff *ctx __maybe_unused,
 	if (is_reply)
 		goto skip_egress_gateway;
 
-	if (egress_gw_snat_needed(tuple->saddr, tuple->daddr, &target->addr)) {
+	if (egress_gw_snat_needed_hook(tuple->saddr, tuple->daddr, &target->addr)) {
 		target->egress_gateway = true;
 		/* If the endpoint is local, then the connection is already tracked. */
 		if (!local_ep)
@@ -1257,7 +1265,7 @@ snat_v6_nat_handle_mapping(struct __ctx_buff *ctx,
 
 		ret = ct_lazy_lookup6(get_ct_map6(&tuple_snat), &tuple_snat,
 				      ctx, off, CT_EGRESS, SCOPE_FORWARD,
-				      &ct_state, &trace->monitor);
+				      CT_ENTRY_ANY, &ct_state, &trace->monitor);
 		if (ret < 0)
 			return ret;
 
@@ -1303,7 +1311,7 @@ snat_v6_rev_nat_handle_mapping(struct __ctx_buff *ctx,
 
 		ret = ct_lazy_lookup6(get_ct_map6(&tuple_revsnat), &tuple_revsnat,
 				      ctx, off, CT_INGRESS, SCOPE_REVERSE,
-				      &ct_state, &trace->monitor);
+				      CT_ENTRY_ANY, &ct_state, &trace->monitor);
 		if (ret < 0)
 			return ret;
 
