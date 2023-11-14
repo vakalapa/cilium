@@ -20,6 +20,7 @@ import (
 	_ "github.com/cilium/cilium/pkg/hubble/metrics/dns"               // invoke init
 	_ "github.com/cilium/cilium/pkg/hubble/metrics/drop"              // invoke init
 	_ "github.com/cilium/cilium/pkg/hubble/metrics/flow"              // invoke init
+	_ "github.com/cilium/cilium/pkg/hubble/metrics/flows-per-pod"     // invoke init
 	_ "github.com/cilium/cilium/pkg/hubble/metrics/flows-to-world"    // invoke init
 	_ "github.com/cilium/cilium/pkg/hubble/metrics/http"              // invoke init
 	_ "github.com/cilium/cilium/pkg/hubble/metrics/icmp"              // invoke init
