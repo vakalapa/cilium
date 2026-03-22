@@ -53,8 +53,8 @@ func initAndValidateDaemonConfig(params daemonConfigParams) error {
 	}
 
 	if params.DaemonConfig.EnableHostFirewall {
-		if params.IPSecConfig.Enabled() {
-			return fmt.Errorf("IPSec cannot be used with the host firewall.")
+		if params.IPSecConfig.Enabled() && params.DaemonConfig.TunnelingEnabled() {
+			return fmt.Errorf("IPSec with tunneling cannot be used with the host firewall. Use native routing mode instead.")
 		}
 	}
 

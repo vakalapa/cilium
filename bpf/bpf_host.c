@@ -1228,10 +1228,16 @@ int cil_from_netdev(struct __ctx_buff *ctx)
 #ifdef ENABLE_IPSEC
 	/* If the packet needs decryption, we want to send it straight to the
 	 * stack. There's no need to run service handling logic, host firewall,
-	 * etc. on an encrypted packet.
-	 * In all other cases (packet doesn't need decryption or already
-	 * decrypted), we want to run all subsequent logic here. We therefore
-	 * ignore the return value from do_decrypt.
+	 * etc. on an encrypted (ESP) packet.
+	 *
+	 * For the first pass (ESP packet), do_decrypt() sets MARK_MAGIC_DECRYPT
+	 * and ctx_is_decrypt() below returns true, sending the packet to the
+	 * XFRM stack for decryption.
+	 *
+	 * For the second pass (already decrypted by XFRM), do_decrypt() clears
+	 * the mark and ctx_is_decrypt() returns false. The packet then falls
+	 * through to do_netdev() for full processing including identity
+	 * resolution via ipcache and host firewall policy enforcement.
 	 */
 	ret = do_decrypt(ctx, proto);
 	if (IS_ERR(ret))
@@ -1753,8 +1759,11 @@ int cil_to_host(struct __ctx_buff *ctx)
 		goto skip_ipsec_nodeport_revdnat;
 
 	/* handle_nat_fwd() tail calls in the majority of cases, so control
-	 * might never return to this program. Since IPsec is not compatible
-	 * iwth Host Firewall, this won't be an issue.
+	 * might never return to this program. This only runs for packets
+	 * being encrypted (egress), where host firewall egress policy was
+	 * already applied at cil_from_host. Skipping host_ingress_policy()
+	 * here is correct since ingress policy doesn't apply to egress
+	 * traffic.
 	 */
 	ret = handle_nat_fwd(ctx, 0, src_id, proto, true, &trace, &ext_err);
 	if (IS_ERR(ret))

@@ -174,5 +174,6 @@ Host Policies known issues
   Policies on service addresses rather than the service endpoints. For details,
   refer to :gh-issue:`12545`.
 
-- Host Firewall and thus Host Policies do not work together with IPsec.
+- Host Firewall with IPsec is supported in native routing mode. The combination
+  of Host Firewall, IPsec, and tunnel mode (VXLAN/Geneve) is not yet supported.
   For details, refer to :gh-issue:`41854`.
