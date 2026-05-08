@@ -8,7 +8,8 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/cilium/cilium/pkg/datapath/linux/ipsec"
+	linuxIPsec "github.com/cilium/cilium/pkg/datapath/linux/ipsec"
+	ipsec "github.com/cilium/cilium/pkg/datapath/linux/ipsec/types"
 	"github.com/cilium/cilium/pkg/datapath/linux/probes"
 	datapathTables "github.com/cilium/cilium/pkg/datapath/tables"
 	"github.com/cilium/cilium/pkg/endpoint/regeneration"
@@ -25,48 +26,59 @@ const (
 	AutoCIDR = "auto"
 )
 
-func initAndValidateDaemonConfig(params daemonConfigParams) error {
+// validateEncryptionDaemonConfig validates the encryption-related (IPsec /
+// WireGuard / strict mode) cross-feature constraints. Pulled into its own
+// function so it can be unit-tested without the rest of
+// initAndValidateDaemonConfig (which depends on KPRInitializer, K8sClient,
+// and other agent-level wiring).
+func validateEncryptionDaemonConfig(
+	cfg *option.DaemonConfig,
+	ipsecCfg ipsec.Config,
+	wgCfg wgTypes.Config,
+) error {
 	// WireGuard and IPSec are mutually exclusive.
-	if params.IPSecConfig.Enabled() && params.WireguardConfig.Enabled() {
+	if ipsecCfg.Enabled() && wgCfg.Enabled() {
 		return fmt.Errorf("WireGuard (--%s) cannot be used with IPsec (--%s)", wgTypes.EnableWireguard, option.EnableIPSec)
 	}
 
-	if !params.IPSecConfig.DNSProxyInsecureSkipTransparentModeCheckEnabled() {
-		if params.IPSecConfig.Enabled() && params.DaemonConfig.EnableL7Proxy && !params.DaemonConfig.DNSProxyEnableTransparentMode {
+	if !ipsecCfg.DNSProxyInsecureSkipTransparentModeCheckEnabled() {
+		if ipsecCfg.Enabled() && cfg.EnableL7Proxy && !cfg.DNSProxyEnableTransparentMode {
 			return fmt.Errorf("IPSec requires DNS proxy transparent mode to be enabled (--dnsproxy-enable-transparent-mode=\"true\")")
 		}
 	}
 
-	if params.IPSecConfig.Enabled() && params.DaemonConfig.TunnelingEnabled() {
-		if err := ipsec.ProbeXfrmStateOutputMask(); err != nil {
+	if ipsecCfg.Enabled() && cfg.TunnelingEnabled() {
+		if err := linuxIPsec.ProbeXfrmStateOutputMask(); err != nil {
 			return fmt.Errorf("IPSec with tunneling requires support for xfrm state output masks (Linux 4.19 or later): %w", err)
 		}
 	}
 
-	if params.IPSecConfig.Enabled() && params.DaemonConfig.EnableEncryptionStrictModeIngress {
+	if ipsecCfg.Enabled() && cfg.EnableEncryptionStrictModeIngress {
 		return fmt.Errorf("IPSec doesnt support strict ingress encryption.")
 	}
 
-	if params.DaemonConfig.EnableEncryptionStrictModeIngress && !params.DaemonConfig.TunnelingEnabled() {
+	if cfg.EnableEncryptionStrictModeIngress && !cfg.TunnelingEnabled() {
 		return fmt.Errorf("Strict ingress encryption requires tunneling to be enabled.")
 	}
 
-	if params.DaemonConfig.EnableHostFirewall {
-		if params.IPSecConfig.Enabled() {
-			return fmt.Errorf("IPSec cannot be used with the host firewall.")
-		}
-	}
-
-	if params.DaemonConfig.LocalRouterIPv4 != "" || params.DaemonConfig.LocalRouterIPv6 != "" {
-		if params.IPSecConfig.Enabled() {
+	if cfg.LocalRouterIPv4 != "" || cfg.LocalRouterIPv6 != "" {
+		if ipsecCfg.Enabled() {
 			return fmt.Errorf("Cannot specify %s or %s with %s.", option.LocalRouterIPv4, option.LocalRouterIPv6, option.EnableIPSec)
 		}
 	}
 
-	if params.IPSecConfig.Enabled() || params.WireguardConfig.Enabled() {
-		if !params.DaemonConfig.EnableCiliumNodeCRD {
+	if ipsecCfg.Enabled() || wgCfg.Enabled() {
+		if !cfg.EnableCiliumNodeCRD {
 			return fmt.Errorf("CiliumNode CRD cannot be disabled when encryption is enabled with WireGuard (--%s) or IPsec (--%s)", wgTypes.EnableWireguard, option.EnableIPSec)
 		}
+	}
+
+	return nil
+}
+
+func initAndValidateDaemonConfig(params daemonConfigParams) error {
+	if err := validateEncryptionDaemonConfig(params.DaemonConfig, params.IPSecConfig, params.WireguardConfig); err != nil {
+		return err
 	}
 
 	// Do the partial kube-proxy replacement initialization before creating BPF

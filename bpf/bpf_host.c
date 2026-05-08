@@ -1379,6 +1379,32 @@ int cil_to_netdev(struct __ctx_buff *ctx)
 	if (ctx_snat_done(ctx))
 		goto skip_host_firewall;
 
+# ifdef ENABLE_IPSEC
+	/* Skip hostFW egress on the post-XFRM IPsec recirculation pass.
+	 *
+	 * For pod-to-pod IPsec, the clear inner pass already short-circuited
+	 * out of hostFW egress in ipv4_host_policy_egress_lookup
+	 * (host_firewall.h:343) because the source identity is a pod, not
+	 * HOST_ID. bpf_lxc enforced endpoint policy on the source pod's veth.
+	 *
+	 * After ipsec_maybe_redirect_to_encrypt + the kernel XFRM wrap, the
+	 * recirculated packet carries MARK_MAGIC_ENCRYPT, which line 1341
+	 * above maps to HOST_ID. That makes the egress short-circuit no
+	 * longer fire, and hostFW would otherwise evaluate the meaningless
+	 * tuple {HOST_ID, remote-node-IP, proto=ESP, port=0} against a
+	 * policy nobody authored — a spurious drop pre-#44459, a
+	 * default-deny verdict post-#44459. Suppress that verdict here.
+	 *
+	 * Why a direct mark check rather than a ctx_skip_host_fw bit:
+	 * the egress hostFW block does not consult ctx_skip_host_fw(), and
+	 * that helper is consume-on-read (overloadable_skb.h), so wiring a
+	 * bit through ipsec_maybe_redirect_to_encrypt would need a new
+	 * cross-hook contract for no real gain. See GH#41854 for context.
+	 */
+	if (ctx_is_encrypt(ctx))
+		goto skip_host_firewall;
+# endif
+
 	if (!eth_is_supported_ethertype(proto)) {
 		ret = DROP_UNSUPPORTED_L2;
 		goto drop_err;
@@ -1749,8 +1775,22 @@ int cil_to_host(struct __ctx_buff *ctx)
 		goto skip_ipsec_nodeport_revdnat;
 
 	/* handle_nat_fwd() tail calls in the majority of cases, so control
-	 * might never return to this program. Since IPsec is not compatible
-	 * iwth Host Firewall, this won't be an issue.
+	 * might never return to this program — the host_ingress_policy call
+	 * below may be skipped on this code path. The reasoning for why that
+	 * is acceptable in the supported Cilium IPsec configuration: IPsec
+	 * encrypts only cross-node pod-to-pod traffic, so the decrypted
+	 * inner packet's dst is always a local pod IP. HostFW's
+	 * dst-identity short-circuit in ipv4_host_policy_ingress
+	 * (host_firewall.h: skips when dst != HOST_ID) makes the
+	 * host_ingress_policy call a no-op for IPsec-decrypted traffic
+	 * anyway; endpoint policy is enforced by bpf_lxc on the destination
+	 * pod's veth.
+	 *
+	 * Coverage: bpf/tests/host_hostfw_ipsec_to_host.{c,_tunnel.c}
+	 * exercise this combined path at the BPF verifier + smoke-test
+	 * level. Full revDNAT correctness for NodePort traffic decrypted
+	 * from IPsec is not asserted in BPF unit tests; see plan §7 open
+	 * question 2 for the kind-cluster regression that closes that gap.
 	 */
 	ret = handle_nat_fwd(ctx, 0, src_id, proto, true, &trace, &ext_err);
 	if (IS_ERR(ret))
