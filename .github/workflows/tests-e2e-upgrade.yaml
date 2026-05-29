@@ -465,11 +465,27 @@ jobs:
         run: |
           make kind-kvstore-start KVSTORE_POD_NAME=kvstore KVSTORE_POD_PORT=2378
 
-          IP=$(kubectl --namespace kube-system get pod kvstore -o jsonpath='{.status.hostIP}')
+          if [ "${{ matrix.kvstore-svc }}" == 'true' ]; then
+            # Front the etcd pod with a ClusterIP Service so Cilium's kvstore
+            # client must dial via Kubernetes service DNS (instead of via the
+            # node host IP). This exercises the dialer's resolver chain at
+            # boot, which is the topology regressed in #45844: with KPR
+            # enabled and no kube-proxy on the host, the BPF LB has to
+            # program the ClusterIP -> backend translation - but that
+            # programming is itself gated on the kvstore Start hook
+            # completing. Reaching etcd via node IP (the default path) skips
+            # the resolver chain entirely and hides the wedge.
+            kubectl --namespace kube-system expose pod kvstore \
+              --name=kvstore --port=2378 --target-port=2378
+            ENDPOINT="http://kvstore.kube-system.svc:2378"
+          else
+            IP=$(kubectl --namespace kube-system get pod kvstore -o jsonpath='{.status.hostIP}')
+            ENDPOINT="http://${IP}:2378"
+          fi
           echo "config= \
             --set=etcd.enabled=true \
             --set=identityAllocationMode=kvstore \
-            --set=etcd.endpoints[0]=http://${IP}:2378 \
+            --set=etcd.endpoints[0]=${ENDPOINT} \
           " >> $GITHUB_OUTPUT
 
       - name: Install Cilium CLI
@@ -747,6 +763,30 @@ jobs:
             echo
             echo "# Retrieving Cilium etcd logs"
             kubectl -n kube-system logs kvstore
+          fi
+
+          if [ "${{ matrix.kvstore-svc }}" == "true" ]; then
+            # When etcd is fronted by a ClusterIP Service, the regression
+            # tracked in #45844 manifests as the operator's kvstore Start
+            # hook parking at "Connecting to etcd server..." (never logging
+            # "Connection to kvstore successfully established") while the
+            # agent loops "Still waiting for Cilium Operator to register
+            # CRDs". Surface those log lines directly so a CI failure is
+            # self-explanatory without needing to pull the full sysdump.
+            echo
+            echo "# kvstore-svc=true: dumping deadlock-signature logs (#45844)"
+            for op in $(kubectl -n kube-system get pods -l name=cilium-operator -o name); do
+              echo "## ${op}"
+              kubectl -n kube-system logs "${op}" --tail=200 | grep -E \
+                'Establishing connection to kvstore|Connecting to etcd|Connection to kvstore successfully|Resolved Service DNS to backend|level=fatal|Start hook failed' \
+                || echo "(no kvstore-related log lines)"
+            done
+            for ag in $(kubectl -n kube-system get pods -l k8s-app=cilium -o name); do
+              echo "## ${ag}"
+              kubectl -n kube-system logs "${ag}" -c cilium-agent --tail=200 | grep -E \
+                'Still waiting for Cilium Operator to register CRDs|Connecting to etcd|Connection to kvstore successfully|level=fatal' \
+                | tail -5 || echo "(no relevant log lines)"
+            done
           fi
 
       - name: Run common post steps

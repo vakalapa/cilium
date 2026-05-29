@@ -69,3 +69,19 @@
   encryption: 'wireguard'
   # L7 testing: IPv6-only configuration - covered by other wireguard tests, can skip
   test-l7: 'false'
+- name: 'kube-proxy-8'
+  kernel: '6.12'
+  kube-proxy: 'none'
+  kpr: 'true'
+  tunnel: 'vxlan'
+  kvstore: 'true'
+  # Reach etcd via a ClusterIP Service rather than a node host IP. This is
+  # the topology that regressed in #45844: with kube-proxy disabled and
+  # Cilium itself responsible for the BPF LB, the kvstore client Start hook
+  # blocks on a ClusterIP that can't be programmed until Cilium has booted -
+  # but Cilium's boot is gated on that very Start hook. Existing kvstore
+  # matrix entries all reach etcd via a node IP or a Docker DNS name,
+  # bypassing the resolver chain that triggers this wedge.
+  kvstore-svc: 'true'
+  # L7 testing: bootstrap-path coverage; L7 features are not exercised here.
+  test-l7: 'false'
