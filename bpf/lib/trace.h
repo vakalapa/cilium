@@ -181,17 +181,6 @@ struct trace_notify {
 /* v2 added IP Trace support; v3 adds per-flow CT packet/byte counters. */
 #define NOTIFY_TRACE_VER 3
 
-/* Per-CPU scratch for struct trace_notify: the v3 struct is too large to
- * stack-allocate in the IPv6 policy program without exceeding the BPF stack
- * limit, so all emitters build it here instead.
- */
-struct {
-	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-	__uint(max_entries, 1);
-	__type(key, __u32);
-	__type(value, struct trace_notify);
-} trace_notify_buf __section_maps_btf;
-
 static __always_inline bool
 emit_trace_notify(enum trace_point obs_point, __u32 monitor)
 {
@@ -239,8 +228,7 @@ _send_trace_notify(struct __ctx_buff *ctx, enum trace_point obs_point,
 	struct ratelimit_settings settings = {
 		.topup_interval_ns = NSEC_PER_SEC,
 	};
-	struct trace_notify *msg;
-	__u32 zero = 0;
+	struct trace_notify msg = {};
 	cls_flags_t flags = CLS_FLAG_NONE;
 
 	_update_trace_metrics(ctx, obs_point, reason, line, file);
@@ -258,10 +246,7 @@ _send_trace_notify(struct __ctx_buff *ctx, enum trace_point obs_point,
 	flags = ctx_classify(ctx, proto, obs_point);
 	cap_len = compute_capture_len(ctx, monitor, flags, obs_point);
 
-	msg = map_lookup_elem(&trace_notify_buf, &zero);
-	if (!msg)
-		return;
-	*msg = (struct trace_notify) {
+	msg = (typeof(msg)) {
 		__notify_common_hdr(CILIUM_NOTIFY_TRACE, obs_point),
 		__notify_pktcap_hdr((__u32)ctx_len, (__u16)cap_len, NOTIFY_TRACE_VER),
 		.src_label	= src,
@@ -274,12 +259,12 @@ _send_trace_notify(struct __ctx_buff *ctx, enum trace_point obs_point,
 		.ct_packets	= ct_packets,
 		.ct_bytes	= ct_bytes,
 	};
-	memset(&msg->orig_ip6, 0, sizeof(union v6addr));
+	memset(&msg.orig_ip6, 0, sizeof(union v6addr));
 
-	trace_extension_hook(ctx, *msg);
+	trace_extension_hook(ctx, msg);
 	ctx_event_output(ctx, &cilium_events,
 			 (cap_len << 32) | BPF_F_CURRENT_CPU,
-			 msg, sizeof(*msg));
+			 &msg, sizeof(msg));
 }
 
 static __always_inline void
@@ -297,8 +282,7 @@ _send_trace_notify4(struct __ctx_buff *ctx, enum trace_point obs_point,
 	struct ratelimit_settings settings = {
 		.topup_interval_ns = NSEC_PER_SEC,
 	};
-	struct trace_notify *msg;
-	__u32 zero = 0;
+	struct trace_notify msg = {};
 	cls_flags_t flags = CLS_FLAG_NONE;
 
 	_update_trace_metrics(ctx, obs_point, reason, line, file);
@@ -316,10 +300,7 @@ _send_trace_notify4(struct __ctx_buff *ctx, enum trace_point obs_point,
 	flags = ctx_classify(ctx, bpf_htons(ETH_P_IP), obs_point);
 	cap_len = compute_capture_len(ctx, monitor, flags, obs_point);
 
-	msg = map_lookup_elem(&trace_notify_buf, &zero);
-	if (!msg)
-		return;
-	*msg = (struct trace_notify) {
+	msg = (typeof(msg)) {
 		__notify_common_hdr(CILIUM_NOTIFY_TRACE, obs_point),
 		__notify_pktcap_hdr((__u32)ctx_len, (__u16)cap_len, NOTIFY_TRACE_VER),
 		.src_label	= src,
@@ -334,10 +315,10 @@ _send_trace_notify4(struct __ctx_buff *ctx, enum trace_point obs_point,
 		.ct_bytes	= ct_bytes,
 	};
 
-	trace_extension_hook(ctx, *msg);
+	trace_extension_hook(ctx, msg);
 	ctx_event_output(ctx, &cilium_events,
 			 (cap_len << 32) | BPF_F_CURRENT_CPU,
-			 msg, sizeof(*msg));
+			 &msg, sizeof(msg));
 }
 
 static __always_inline void
@@ -356,8 +337,7 @@ _send_trace_notify6(struct __ctx_buff *ctx, enum trace_point obs_point,
 	struct ratelimit_settings settings = {
 		.topup_interval_ns = NSEC_PER_SEC,
 	};
-	struct trace_notify *msg;
-	__u32 zero = 0;
+	struct trace_notify msg = {};
 	cls_flags_t flags = CLS_FLAG_NONE;
 
 	_update_trace_metrics(ctx, obs_point, reason, line, file);
@@ -375,10 +355,7 @@ _send_trace_notify6(struct __ctx_buff *ctx, enum trace_point obs_point,
 	flags = ctx_classify(ctx, bpf_htons(ETH_P_IPV6), obs_point);
 	cap_len = compute_capture_len(ctx, monitor, flags, obs_point);
 
-	msg = map_lookup_elem(&trace_notify_buf, &zero);
-	if (!msg)
-		return;
-	*msg = (struct trace_notify) {
+	msg = (typeof(msg)) {
 		__notify_common_hdr(CILIUM_NOTIFY_TRACE, obs_point),
 		__notify_pktcap_hdr((__u32)ctx_len, (__u16)cap_len, NOTIFY_TRACE_VER),
 		.src_label	= src,
@@ -392,12 +369,12 @@ _send_trace_notify6(struct __ctx_buff *ctx, enum trace_point obs_point,
 		.ct_bytes	= ct_bytes,
 	};
 
-	ipv6_addr_copy(&msg->orig_ip6, orig_addr);
+	ipv6_addr_copy(&msg.orig_ip6, orig_addr);
 
-	trace_extension_hook(ctx, *msg);
+	trace_extension_hook(ctx, msg);
 	ctx_event_output(ctx, &cilium_events,
 			 (cap_len << 32) | BPF_F_CURRENT_CPU,
-			 msg, sizeof(*msg));
+			 &msg, sizeof(msg));
 }
 
 #else
