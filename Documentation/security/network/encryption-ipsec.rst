@@ -1,3 +1,5 @@
+.. This file was not reviewed by a human before submission
+
 .. only:: not (epub or latex or html)
 
     WARNING: You are looking at unreleased Cilium documentation.
@@ -416,7 +418,8 @@ Limitations
 
     * Transparent encryption is not currently supported when chaining Cilium on
       top of other CNI plugins. For more information, see :gh-issue:`15596`.
-    * :ref:`HostPolicies` are not currently supported with IPsec encryption.
+    * :ref:`HostPolicies` are enforced on ESP traffic between nodes, which must
+      be explicitly allowed. See :ref:`HostPolicies` for details.
     * IPsec encryption is not supported on clusters or clustermeshes with more
       than 65535 nodes.
     * Decryption with Cilium IPsec is limited to a single CPU core per IPsec

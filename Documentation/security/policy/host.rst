@@ -1,3 +1,5 @@
+.. This file was not reviewed by a human before submission
+
 .. only:: not (epub or latex or html)
 
     WARNING: You are looking at unreleased Cilium documentation.
@@ -113,6 +115,14 @@ the label ``type=egress-worker`` on TCP ports 22, 6443/443 (kube-apiserver), 237
 .. literalinclude:: ../../../examples/policies/host/allow-extended-protocols.yaml
   :language: yaml
 
+When :ref:`IPsec encryption <encryption_ipsec>` is enabled, Host Policies are
+also enforced on the ESP packets exchanged between nodes, before decryption on
+ingress and after encryption on egress. Host Policies that restrict traffic
+between nodes must therefore allow ESP to and from ``remote-node``, either with
+an L3-only rule or with a ``protocol: ESP`` rule. Enabling
+``--enable-extended-ip-protocols`` is recommended so that ESP is tracked by
+conntrack.
+
 .. _troubleshooting_host_policies:
 
 Troubleshooting Host Policies
@@ -195,6 +205,3 @@ Host Policies known issues
   services for the native device (such as NodePort), hosts will enforce Host
   Policies on service addresses rather than the service endpoints. For details,
   refer to :gh-issue:`12545`.
-
-- Host Firewall and thus Host Policies do not work together with IPsec.
-  For details, refer to :gh-issue:`41854`.

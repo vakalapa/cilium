@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
 /* Copyright Authors of Cilium */
+/* This file was not reviewed by a human before submission */
 
 #include <bpf/ctx/skb.h>
 #include <bpf/api.h>
@@ -1252,6 +1253,11 @@ drop_err_ingress:
 	return send_drop_notify_error(ctx, identity, ret, dir);
 }
 
+static __always_inline
+int host_ingress_policy(struct __ctx_buff *ctx, __be16 proto,
+			__u32 src_sec_identity, bool traced, bool use_tailcall,
+			__s8 *ext_err);
+
 /*
  * from-netdev is attached as a tc ingress filter to one or more physical devices
  * managed by Cilium (e.g., eth0).
@@ -1261,6 +1267,7 @@ int cil_from_netdev(struct __ctx_buff *ctx)
 {
 	__u32 src_id = UNKNOWN_ID;
 	__be16 proto = 0;
+	__s8 ext_err = 0;
 	__u32 flags;
 
 	bpf_clear_meta(ctx);
@@ -1310,9 +1317,11 @@ int cil_from_netdev(struct __ctx_buff *ctx)
 	}
 
 	if (CONFIG(enable_ipsec)) {
+		bool was_decrypt = ctx_is_decrypt(ctx);
+
 		/* If the packet needs decryption, we want to send it straight to the
-		 * stack. There's no need to run service handling logic, host firewall,
-		 * etc. on an encrypted packet.
+		 * stack, after the host firewall has evaluated the ESP packet. There's
+		 * no need to run service handling logic etc. on an encrypted packet.
 		 * In all other cases (packet doesn't need decryption or already
 		 * decrypted), we want to run all subsequent logic here. We therefore
 		 * ignore the return value from do_decrypt.
@@ -1321,8 +1330,15 @@ int cil_from_netdev(struct __ctx_buff *ctx)
 		if (IS_ERR(ret))
 			goto drop_err;
 
-		if (ctx_is_decrypt(ctx))
+		if (ctx_is_decrypt(ctx)) {
+			if (CONFIG(enable_host_firewall) && !was_decrypt) {
+				ret = host_ingress_policy(ctx, proto, UNKNOWN_ID, true,
+							  true, &ext_err);
+				if (IS_ERR(ret))
+					goto drop_err;
+			}
 			return CTX_ACT_OK;
+		}
 	}
 
 	ret = tcx_early_hook(ctx, proto);
@@ -1331,7 +1347,7 @@ int cil_from_netdev(struct __ctx_buff *ctx)
 
 	return do_netdev(ctx, proto, UNKNOWN_ID, TRACE_FROM_NETWORK, false);
 drop_err:
-	return send_drop_notify_error(ctx, src_id, ret, METRIC_INGRESS);
+	return send_drop_notify_error_ext(ctx, src_id, ret, ext_err, METRIC_INGRESS);
 }
 
 /*
@@ -1870,8 +1886,8 @@ int cil_to_host(struct __ctx_buff *ctx)
 		if (NODEPORT_ENABLED && ctx_is_encrypt(ctx) &&
 		    validate_ethertype(ctx, &proto)) {
 			/* handle_nat_fwd() tail calls in the majority of cases, so control
-			 * might never return to this program. Since IPsec is not compatible
-			 * iwth Host Firewall, this won't be an issue.
+			 * might never return to this program. Skipping the host firewall
+			 * below is fine, as it only enforces on packets destined to the host.
 			 */
 			ret = handle_nat_fwd(ctx, 0, src_id, proto, true, &trace,
 					     &ext_err);
