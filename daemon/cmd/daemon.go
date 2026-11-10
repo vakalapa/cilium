@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Authors of Cilium
+// This file was not reviewed by a human before submission
 
 package cmd
 
@@ -40,12 +41,6 @@ func initAndValidateDaemonConfig(params daemonConfigParams) error {
 
 	if params.IPSecConfig.Enabled() && params.DaemonConfig.EnableEncryptionStrictModeIngress {
 		return fmt.Errorf("IPSec doesnt support strict ingress encryption.")
-	}
-
-	if params.DaemonConfig.EnableHostFirewall {
-		if params.IPSecConfig.Enabled() {
-			return fmt.Errorf("IPSec cannot be used with the host firewall.")
-		}
 	}
 
 	if params.DaemonConfig.LocalRouterIPv4 != "" || params.DaemonConfig.LocalRouterIPv6 != "" {
